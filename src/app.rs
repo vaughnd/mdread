@@ -1,16 +1,19 @@
 //! Application state, input handling and the top-level layout
 //! (outline sidebar · reading column · file sidebar · status bar).
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::scroll_area::{DragScroll, ScrollSource};
 use egui::style::ScrollAnimation;
+use egui::text::{CCursor, CCursorRange};
+use egui::text_selection::LabelSelectionState;
 use egui::{
-    pos2, vec2, Align, Align2, Color32, Context, CornerRadius, Frame, Id, Key, Label, Margin, Modifiers, Panel, Rect,
-    RichText, ScrollArea, Sense, Shape, Stroke, TextEdit, Ui, UiBuilder, ViewportCommand,
+    pos2, vec2, Align, Align2, Button, Color32, Context, CornerRadius, Event, Frame, Id, Key, Label, LayerId, Layout,
+    Margin, Modifiers, Panel, PointerButton, Popup, PopupAnchor, PopupCloseBehavior, PopupKind, Pos2, Rect, RichText,
+    ScrollArea, Sense, Shape, Stroke, TextEdit, Ui, UiBuilder, ViewportCommand,
 };
 use notify::Watcher;
 use serde::{Deserialize, Serialize};
@@ -77,6 +80,32 @@ struct Measure {
     measured: bool,
 }
 
+/// The right-click menu over the reading column.
+///
+/// Its open state lives here rather than in egui's popup memory because the
+/// right-press that opens it is swallowed in `raw_input_hook` before egui sees it:
+/// egui collapses the label text selection on any press over a label, which would
+/// leave nothing for "Copy" to copy.
+struct ContextMenu {
+    pos: Pos2,
+    link: Option<String>,
+    image: Option<String>,
+    code: Option<Arc<str>>,
+    /// Popup rect from the last frame; presses outside it dismiss the menu.
+    rect: Rect,
+    /// The enabled "Copy" item's rect; a press on it becomes an `Event::Copy`.
+    copy_rect: Option<Rect>,
+}
+
+#[derive(Clone, Copy)]
+enum MenuItem {
+    OpenLink,
+    CopyLink,
+    OpenImage,
+    CopyImage,
+    CopyCode,
+}
+
 pub struct App {
     settings: Settings,
     fonts: FontSet,
@@ -106,6 +135,14 @@ pub struct App {
     search: SearchState,
     hl: Highlighter,
     hovered_link: Option<(usize, u32)>,
+
+    /// Reading-column viewport from the last frame, in points.
+    content_rect: Rect,
+    menu: Option<ContextMenu>,
+    /// Right-press position waiting for the next frame's hover info.
+    menu_request: Option<Pos2>,
+    /// A press was swallowed in `raw_input_hook`; swallow its release too.
+    swallow_release: Option<PointerButton>,
 
     history: Vec<(PathBuf, f32)>,
     history_pos: usize,
@@ -216,6 +253,10 @@ impl App {
             search: SearchState::default(),
             hl: Highlighter::new(ctx.clone()),
             hovered_link: None,
+            content_rect: Rect::NOTHING,
+            menu: None,
+            menu_request: None,
+            swallow_release: None,
             history: Vec::new(),
             history_pos: 0,
             watcher: None,
@@ -444,8 +485,7 @@ impl App {
             None => (url, None),
         };
         let rel = percent_decode(path_part);
-        let base = self.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-        let abs = if Path::new(&rel).is_absolute() { PathBuf::from(&rel) } else { base.join(&rel) };
+        let abs = self.resolve_local(&rel);
         if rel.is_empty() {
             if let Some(f) = frag {
                 self.open_link(&format!("#{f}"), ctx);
@@ -474,6 +514,185 @@ impl App {
             }
         } else {
             self.set_status(format!("Not found: {}", abs.display()));
+        }
+    }
+
+    /// Absolute path for a link written relative to the current document,
+    /// with `.` and `..` segments folded.
+    fn resolve_local(&self, rel: &str) -> PathBuf {
+        let joined = if Path::new(rel).is_absolute() {
+            PathBuf::from(rel)
+        } else {
+            let base = self.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
+            base.join(rel)
+        };
+        let mut out = PathBuf::new();
+        for c in joined.components() {
+            match c {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !out.pop() && !out.has_root() {
+                        out.push(c);
+                    }
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// The link as it should read outside the viewer: web links and anchors as
+    /// written, relative file links as absolute paths.
+    fn link_for_clipboard(&self, url: &str) -> String {
+        let url = url.trim();
+        if url.starts_with('#') || url.contains("://") || url.starts_with("mailto:") || url.starts_with("www.") {
+            return url.to_owned();
+        }
+        let (path_part, frag) = url.split_once('#').unwrap_or((url, ""));
+        let rel = percent_decode(path_part);
+        if rel.is_empty() {
+            return url.to_owned();
+        }
+        let abs = self.resolve_local(&rel);
+        if frag.is_empty() {
+            abs.display().to_string()
+        } else {
+            format!("{}#{frag}", abs.display())
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Context menu
+    // ------------------------------------------------------------------
+
+    /// Returns false for events egui should not see; see `raw_input_hook`.
+    fn keep_event(&mut self, e: &Event, copy: &mut bool) -> bool {
+        match e {
+            Event::PointerButton { pos, button, pressed: true, .. } => {
+                let (pos, button) = (*pos, *button);
+                if let Some(menu) = self.menu.take() {
+                    if menu.rect.contains(pos) {
+                        if menu.copy_rect.is_some_and(|r| r.contains(pos)) {
+                            *copy = true;
+                            self.swallow_release = Some(button);
+                            return false;
+                        }
+                        self.menu = Some(menu);
+                        return true;
+                    }
+                    if button != PointerButton::Secondary {
+                        // A click outside only dismisses the menu.
+                        self.swallow_release = Some(button);
+                        return false;
+                    }
+                }
+                if button == PointerButton::Secondary && !self.show_help && self.content_rect.contains(pos) {
+                    log::trace!("context menu requested at {pos:?}");
+                    self.menu_request = Some(pos);
+                    self.swallow_release = Some(button);
+                    return false;
+                }
+                true
+            }
+            Event::PointerButton { button, pressed: false, .. } => {
+                if self.swallow_release == Some(*button) {
+                    self.swallow_release = None;
+                    return false;
+                }
+                true
+            }
+            Event::MouseWheel { .. } => {
+                self.menu = None;
+                true
+            }
+            _ => true,
+        }
+    }
+
+    fn show_context_menu(&mut self, ctx: &Context) {
+        let Some(mut menu) = self.menu.take() else { return };
+        let has_selection = ctx.plugin::<LabelSelectionState>().lock().has_selection();
+        let base = self.settings.base_size;
+        let mut picked: Option<MenuItem> = None;
+        let mut copy_rect = None;
+        let out = Popup::new(Id::new("context-menu"), ctx.clone(), PopupAnchor::Position(menu.pos), LayerId::background())
+            .kind(PopupKind::Menu)
+            .open(true)
+            .close_behavior(PopupCloseBehavior::IgnoreClicks)
+            .layout(Layout::top_down_justified(Align::Min))
+            .style(egui::containers::menu::menu_style)
+            .show(|ui| {
+                ui.set_min_width(base * 9.0);
+                // A press on "Copy" is handled in `raw_input_hook`, see `ContextMenu::copy_rect`.
+                let copy = ui.add_enabled(has_selection, Button::new("Copy"));
+                if has_selection {
+                    copy_rect = Some(copy.rect);
+                }
+                if menu.link.is_some() {
+                    ui.separator();
+                    if ui.button("Open link").clicked() {
+                        picked = Some(MenuItem::OpenLink);
+                    }
+                    if ui.button("Copy link").clicked() {
+                        picked = Some(MenuItem::CopyLink);
+                    }
+                }
+                if menu.image.is_some() {
+                    ui.separator();
+                    if ui.button("Open image").clicked() {
+                        picked = Some(MenuItem::OpenImage);
+                    }
+                    if ui.button("Copy image address").clicked() {
+                        picked = Some(MenuItem::CopyImage);
+                    }
+                }
+                if menu.code.is_some() {
+                    ui.separator();
+                    if ui.button("Copy code block").clicked() {
+                        picked = Some(MenuItem::CopyCode);
+                    }
+                }
+            });
+        menu.rect = out.map(|o| o.response.rect).unwrap_or(Rect::NOTHING);
+        menu.copy_rect = copy_rect;
+        match picked {
+            None => self.menu = Some(menu),
+            Some(item) => self.menu_action(item, &menu, ctx),
+        }
+    }
+
+    fn menu_action(&mut self, item: MenuItem, menu: &ContextMenu, ctx: &Context) {
+        match item {
+            MenuItem::OpenLink => {
+                if let Some(url) = &menu.link {
+                    self.open_link(url, ctx);
+                }
+            }
+            MenuItem::CopyLink => {
+                if let Some(url) = &menu.link {
+                    ctx.copy_text(self.link_for_clipboard(url));
+                    self.set_status("Copied link to clipboard");
+                }
+            }
+            MenuItem::OpenImage => {
+                if let Some(uri) = &menu.image {
+                    let target = local_path(uri);
+                    open_external(target);
+                    self.set_status(format!("Opened {target}"));
+                }
+            }
+            MenuItem::CopyImage => {
+                if let Some(uri) = &menu.image {
+                    ctx.copy_text(local_path(uri).to_owned());
+                    self.set_status("Copied image address to clipboard");
+                }
+            }
+            MenuItem::CopyCode => {
+                if let Some(code) = &menu.code {
+                    ctx.copy_text(code.to_string());
+                    self.set_status("Copied code block to clipboard");
+                }
+            }
         }
     }
 
@@ -513,6 +732,11 @@ impl App {
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if let Some(p) = dropped.into_iter().next() {
             self.load_path(p, true, ctx);
+        }
+
+        let menu_open = self.menu.is_some();
+        if menu_open && ctx.input(|i| i.events.iter().any(|e| matches!(e, Event::Key { pressed: true, .. }))) {
+            self.menu = None;
         }
 
         let typing = ctx.memory(|m| m.focused().is_some());
@@ -675,7 +899,9 @@ impl App {
                 Cmd::Back => self.go_history(-1, ctx),
                 Cmd::Forward => self.go_history(1, ctx),
                 Cmd::Escape => {
-                    if self.show_help {
+                    if menu_open {
+                        // Already closed above.
+                    } else if self.show_help {
                         self.show_help = false;
                     } else if self.search.open {
                         self.search.clear();
@@ -949,13 +1175,18 @@ impl App {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Find").color(pal.text_dim));
-                    let resp = ui.add(
-                        TextEdit::singleline(&mut self.search.query)
-                            .hint_text("Search this document…")
-                            .desired_width((base * 24.0).min(ui.available_width() * 0.5)),
-                    );
+                    let out = TextEdit::singleline(&mut self.search.query)
+                        .hint_text("Search this document…")
+                        .desired_width((base * 24.0).min(ui.available_width() * 0.5))
+                        .show(ui);
+                    let resp = out.response;
                     if self.search.focus_pending {
                         resp.request_focus();
+                        // Select the previous query so that typing replaces it.
+                        let mut state = out.state;
+                        let end = CCursor::new(self.search.query.chars().count());
+                        state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(0), end)));
+                        state.store(ctx, resp.id);
                         self.search.focus_pending = false;
                     }
                     if resp.lost_focus() && ctx.input(|i| i.key_pressed(Key::Enter)) {
@@ -1086,6 +1317,7 @@ impl App {
                     ("r  F5", "Reload (files also reload automatically)"),
                     ("Click link", "Open in browser, or follow to another .md"),
                     ("Hover code block", "Copy button"),
+                    ("Right-click", "Copy selection, open or copy link"),
                     (&quit_key, "Quit"),
                 ];
                 egui::Grid::new("help-grid").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
@@ -1114,6 +1346,8 @@ impl App {
         let base = self.settings.base_size;
 
         let Some(doc) = self.doc.clone() else {
+            self.content_rect = Rect::NOTHING;
+            self.menu_request = None;
             self.show_welcome(ui);
             return;
         };
@@ -1210,7 +1444,20 @@ impl App {
 
         let actions = std::mem::take(&mut rc.actions);
         let new_hovered = rc.new_hovered_link;
+        let hover = std::mem::take(&mut rc.hover);
         drop(rc);
+
+        self.content_rect = out.inner_rect;
+        if let Some(pos) = self.menu_request.take() {
+            self.menu = Some(ContextMenu { pos, link: hover.link, image: hover.image, code: hover.code, rect: Rect::NOTHING, copy_rect: None });
+            // The swallowed press would have taken focus from the search box.
+            ctx.memory_mut(|m| {
+                if let Some(id) = m.focused() {
+                    m.surrender_focus(id);
+                }
+            });
+            ctx.request_repaint();
+        }
 
         if new_hovered != self.hovered_link {
             self.hovered_link = new_hovered;
@@ -1334,6 +1581,7 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 self.show_content(ui, &ctx);
             });
+        self.show_context_menu(&ctx);
         self.show_help(&ctx);
         log::trace!(
             "frame {} at {:.0} ms took {:.2} ms",
@@ -1341,6 +1589,19 @@ impl eframe::App for App {
             self.started.elapsed().as_secs_f64() * 1000.0,
             frame_t0.elapsed().as_secs_f64() * 1000.0
         );
+    }
+
+    /// Runs before egui sees the frame's input. Right-presses over the reading column
+    /// are swallowed and turned into a context-menu request, because egui collapses
+    /// the label text selection on any press over a label. A press on the menu's
+    /// "Copy" item becomes an `Event::Copy`, which is how egui copies that selection.
+    fn raw_input_hook(&mut self, _ctx: &Context, raw: &mut egui::RawInput) {
+        let mut copy = false;
+        raw.events.retain(|e| self.keep_event(e, &mut copy));
+        if copy {
+            raw.events.push(Event::Copy);
+            self.set_status("Copied selection to clipboard");
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -1404,6 +1665,11 @@ fn wake_after(ctx: &Context, delay: Duration) {
             ctx.request_repaint();
         })
         .ok();
+}
+
+/// A `file://` URI as a plain path; anything else unchanged.
+fn local_path(uri: &str) -> &str {
+    uri.strip_prefix("file://").unwrap_or(uri)
 }
 
 fn open_external(target: &str) {

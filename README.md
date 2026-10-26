@@ -20,7 +20,8 @@ pulldown-cmark, highlights code with syntect.
   images (PNG, JPEG, GIF, WebP, SVG), inline badges, HTML `<img>`.
 - Links: web links open in the browser, relative `.md` links open in the
   viewer (with back/forward), `#anchors` jump within the document.
-- Search with highlighted matches, copy button on code blocks, text selection.
+- Search with highlighted matches, copy button on code blocks, text selection,
+  right-click menu to copy the selection or open and copy links.
 
 ## Build
 

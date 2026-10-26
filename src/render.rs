@@ -25,6 +25,15 @@ pub enum Action {
     Status(String),
 }
 
+/// What the pointer is over this frame, for the right-click menu.
+#[derive(Default)]
+pub struct Hover {
+    pub link: Option<String>,
+    /// Resolved image URI (`file://…` or `http…`).
+    pub image: Option<String>,
+    pub code: Option<Arc<str>>,
+}
+
 pub struct RenderCtx<'a> {
     pub pal: &'a Palette,
     pub fonts: &'a FontSet,
@@ -37,6 +46,7 @@ pub struct RenderCtx<'a> {
     pub hovered_link: Option<(usize, u32)>,
     pub new_hovered_link: Option<(usize, u32)>,
     pub actions: Vec<Action>,
+    pub hover: Hover,
     list_depth: u8,
     text_color: Color32,
     scale: f32,
@@ -66,6 +76,7 @@ impl<'a> RenderCtx<'a> {
             hovered_link,
             new_hovered_link: None,
             actions: Vec::new(),
+            hover: Hover::default(),
             list_depth: 0,
             text_color: pal.text,
             scale: 1.0,
@@ -229,6 +240,7 @@ impl<'a> RenderCtx<'a> {
             let Some(link) = inline.links.get(*li as usize) else { return };
             ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
             self.new_hovered_link = Some((inline.id, *li));
+            self.hover.link = Some(link.url.clone());
             let tip = if link.title.is_empty() { link.url.clone() } else { format!("{}\n{}", link.title, link.url) };
             resp.clone().on_hover_text(tip);
             if resp.clicked() {
@@ -339,7 +351,7 @@ impl<'a> RenderCtx<'a> {
             return;
         };
         let avail = ui.available_width().max(16.0);
-        let mut image = egui::Image::from_uri(uri)
+        let mut image = egui::Image::from_uri(uri.clone())
             .fit_to_original_size(1.0)
             .max_width(avail)
             .show_loading_spinner(false)
@@ -355,6 +367,9 @@ impl<'a> RenderCtx<'a> {
             }
             Ok(_) => {
                 let resp = ui.add(image);
+                if ui.rect_contains_pointer(resp.rect) {
+                    self.hover.image = Some(uri);
+                }
                 if !img.title.is_empty() {
                     resp.on_hover_text(&img.title);
                 }
@@ -434,9 +449,12 @@ impl<'a> RenderCtx<'a> {
         let hovered = ui.rect_contains_pointer(rect);
         let corner = rect.right_top() + vec2(-pad * 0.6, pad * 0.35);
         if hovered {
+            self.hover.code = Some(cb.text.clone());
             let brect = Rect::from_min_max(corner + vec2(-fs * 3.2, 0.0), corner + vec2(0.0, fs * 1.25));
             let b = Button::new(RichText::new("copy").size(fs * 0.72)).small();
-            if ui.put(brect, b).clicked() {
+            // `place`, not `put`: `put` would move the layout cursor back up to the button,
+            // so every block after a hovered code block would be laid out on top of it.
+            if ui.place(brect, b).clicked() {
                 ui.ctx().copy_text(cb.text.to_string());
                 self.actions.push(Action::Status("Copied code block to clipboard".into()));
             }
