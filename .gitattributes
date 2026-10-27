@@ -1,0 +1,7 @@
+# Normalize line endings in the repo; check out scripts with the endings their
+# interpreters expect regardless of core.autocrlf.
+* text=auto
+*.sh text eol=lf
+*.desktop text eol=lf
+*.png binary
+*.ico binary

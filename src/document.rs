@@ -147,6 +147,8 @@ impl Document {
         opts.insert(Options::ENABLE_SUPERSCRIPT);
         opts.insert(Options::ENABLE_SUBSCRIPT);
 
+        // Callers strip byte order marks already (text::decode); this is a safety net.
+        let src = src.strip_prefix('\u{FEFF}').unwrap_or(src);
         let mut b = Builder::default();
         for ev in Parser::new_ext(src, opts) {
             b.event(ev);
@@ -1045,13 +1047,15 @@ pub fn percent_decode(s: &str) -> String {
     if !s.contains('%') {
         return s.to_owned();
     }
+    // Works on bytes: slicing the &str after a '%' could split a multi-byte character.
+    let hex = |b: Option<&u8>| b.and_then(|b| (*b as char).to_digit(16)).map(|d| d as u8);
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() + 0 && i + 2 <= bytes.len() - 1 {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                out.push(v);
+        if bytes[i] == b'%' {
+            if let (Some(hi), Some(lo)) = (hex(bytes.get(i + 1)), hex(bytes.get(i + 2))) {
+                out.push(hi << 4 | lo);
                 i += 3;
                 continue;
             }
@@ -1060,4 +1064,24 @@ pub fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_decode_handles_escapes_and_stray_percents() {
+        assert_eq!(percent_decode("a%20b%2Fc%e2%82%AC"), "a b/c\u{20AC}");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("50%x"), "50%x");
+        assert_eq!(percent_decode("a%\u{20AC}b.png"), "a%\u{20AC}b.png");
+        assert_eq!(percent_decode("%4\u{20AC}"), "%4\u{20AC}");
+    }
+
+    #[test]
+    fn leading_bom_does_not_hide_the_first_heading() {
+        let doc = Document::parse("\u{FEFF}# Title\n");
+        assert_eq!(doc.headings.len(), 1);
+    }
 }

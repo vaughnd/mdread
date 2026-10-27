@@ -37,6 +37,9 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         let name = e.file_name();
         let name = name.to_string_lossy();
         let Ok(ft) = e.file_type() else { continue };
+        if hidden(&e) {
+            continue;
+        }
         if ft.is_dir() {
             if depth + 1 < MAX_DEPTH && !name.starts_with('.') && !SKIP_DIRS.contains(&name.as_ref()) {
                 walk(&path, depth + 1, out);
@@ -48,6 +51,21 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             }
         }
     }
+}
+
+/// Windows marks hidden folders (AppData, $RECYCLE.BIN, System Volume Information) with
+/// attributes rather than a leading dot. The attributes come with the directory listing,
+/// so this costs no extra system call.
+#[cfg(windows)]
+fn hidden(e: &std::fs::DirEntry) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM};
+    e.metadata().is_ok_and(|m| m.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0)
+}
+
+#[cfg(not(windows))]
+fn hidden(_: &std::fs::DirEntry) -> bool {
+    false
 }
 
 pub fn spawn_scan(dir: PathBuf, ctx: egui::Context) -> mpsc::Receiver<Vec<PathBuf>> {

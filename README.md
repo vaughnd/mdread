@@ -1,15 +1,16 @@
 # mdread
 
-A very fast, GPU-rendered Markdown viewer for Linux and macOS, built for large
-high-DPI screens. Rust + [egui](https://github.com/emilk/egui) (OpenGL), parses with
-pulldown-cmark, highlights code with syntect.
+A very fast, GPU-rendered Markdown viewer for Linux, macOS and Windows 11, built
+for large high-DPI screens. Rust + [egui](https://github.com/emilk/egui) (OpenGL,
+with a Direct3D 12 fallback on Windows), parses with pulldown-cmark, highlights
+code with syntect.
 
 - Cold start to first frame in about 100 ms; an 800 KB / 1100-block document
   parses in ~4 ms and renders in under 2 ms per frame (only visible blocks are
   laid out).
 - Crisp text at any scale, including fractional Wayland scaling and Retina,
-  using the system's Ubuntu Sans or SF Pro (variable weight) and JetBrains Mono
-  or any installed Nerd Font.
+  using the system's Ubuntu Sans, SF Pro or Segoe UI Variable (variable weight)
+  and JetBrains Mono, Cascadia or any installed Nerd Font.
 - Widescreen layout: outline sidebar that tracks the section you are reading,
   files sidebar for the rest of the folder, and a reading column capped at a
   comfortable measure (adjustable, or full width).
@@ -50,6 +51,26 @@ Line Tools and nothing else). `./install.sh` copies the binary to `~/.local/bin`
 and skips the desktop entry. Shortcuts use `⌘` where the table below says `Ctrl`,
 and the file dialog is the native panel instead of zenity.
 
+### Windows
+
+Install Rust with [rustup](https://rustup.rs) (the default MSVC toolchain) and
+Visual Studio 2022 Build Tools with the "Desktop development with C++" workload
+(MSVC and the Windows SDK, whose `rc.exe` embeds the icon and version info).
+
+```powershell
+cargo build --release     # target\release\mdread.exe
+```
+
+`mdread.exe` is a single self-contained file: `.cargo/config.toml` links the C
+runtime statically, so no VC++ redistributable is needed (`cargo install` run
+from outside the checkout does not read that file). Copy it anywhere; there is
+no installer step, and nothing is registered with Windows.
+
+mdread draws with OpenGL and switches to Direct3D 12 by itself when OpenGL is
+not usable, which includes the WARP software renderer in VMs, Remote Desktop
+and Windows Sandbox. `MDREAD_RENDERER=glow` or `wgpu` forces one of the two.
+Native ARM64 builds need clang on `PATH` and are untested.
+
 ## Usage
 
 ```bash
@@ -60,8 +81,38 @@ cat file.md | mdread -                # from stdin
 mdread --light file.md                # force a theme for this session
 ```
 
-Open the file dialog with `Ctrl+O` (`⌘O` on macOS; uses zenity on Linux) or drop
-a file onto the window.
+Open the file dialog with `Ctrl+O` (`⌘O` on macOS; uses zenity on Linux, the
+standard Open dialog on Windows) or drop a file onto the window. On Windows a
+dropped folder opens its README.md or index.md (else its first Markdown file),
+and a dropped shortcut opens its target.
+
+Files may be UTF-8 or, with a byte order mark, UTF-16; anything else is read
+in the system ANSI code page on Windows and as Windows-1252 elsewhere, and the
+status bar says "Decoded as …". Line endings do not matter.
+
+In PowerShell, `<` does not exist and Windows PowerShell 5.1 pipes non-ASCII
+text as `?`, so open files by name where you can:
+
+```powershell
+mdread README.md
+Get-Content -Raw -Encoding UTF8 file.md | mdread -     # PowerShell 7: drop -Encoding
+mdread - < file.md                                     # cmd.exe
+```
+
+(in 5.1, set `$OutputEncoding = [Text.UTF8Encoding]::new($false)` first.)
+mdread is a GUI program, so `--help` and `--version` print into the terminal you
+started it from, possibly after the next prompt, and show a message box when
+there is no terminal. In PowerShell, pipe instead of redirecting
+(`mdread --help | Out-File help.txt`, `mdread --version | Out-String`): `>` and
+`$x = mdread ...` capture nothing and `$LASTEXITCODE` is not set. In cmd.exe `>`
+works.
+
+On Windows, links leave the app only for `http`, `https` and `mailto`. A link to
+a local file opens it in its default app only for images, PDF, plain text, data
+files (CSV, JSON, YAML, TOML) and audio/video; anything else (exe, scripts,
+shortcuts, HTML, Office documents) is shown selected in Explorer rather than run.
+Images and links on network (UNC, `//host`) paths are blocked unless they are on
+the same share as the open document.
 
 ## Keys
 
@@ -77,12 +128,14 @@ a file onto the window.
 | `t` | dark / light |
 | `w` | full-width column; `[` `]` narrower / wider |
 | `Ctrl +` `Ctrl -` `Ctrl 0`, `Ctrl`+scroll | zoom |
-| `Alt+←` `Backspace` / `Alt+→` | back / forward |
+| `Alt+←` `Backspace` / `Alt+→` | back / forward (also the mouse side buttons on Windows) |
 | `r` `F5` | reload |
 | `?` `F1` | help |
 | `q` `Ctrl+Q` | quit |
 
-Settings (zoom, column width, sidebars, theme, window size) persist between runs.
+Settings (zoom, column width, sidebars, theme, window size) persist between runs,
+in `~/.local/share/mdread`, `~/Library/Application Support/mdread` or
+`%APPDATA%\mdread\data`.
 
 ## Fonts
 
@@ -95,6 +148,23 @@ directories (`~/.local/share/fonts`, `~/.fonts`, `~/Library/Fonts`) before the
 system ones, so installing a preferred font per user is enough. Override with
 `MDREAD_FONT=/path/to/font.ttf` and `MDREAD_MONO_FONT=...`.
 
+On Windows, body text is Segoe UI Variable (bold through its weight axis,
+italics slanted), else Segoe UI, else Arial; code is any installed Nerd Font,
+else Cascadia Mono / Cascadia Code, else Consolas. Fonts installed "for me" in
+`%LOCALAPPDATA%\Microsoft\Windows\Fonts` win over `%WINDIR%\Fonts`. Chinese,
+Japanese and Korean text use Microsoft YaHei UI, Yu Gothic UI and Malgun Gothic,
+and arrows, check marks and other symbols Segoe UI Symbol; each is loaded the
+first time a document needs it. Overrides take a full path, a `~\` path or a
+bare file name from the font folders:
+
+```powershell
+$env:MDREAD_FONT = 'C:\Windows\Fonts\segoeui.ttf'
+$env:MDREAD_MONO_FONT = 'consola.ttf'
+```
+
+egui renders text with greyscale antialiasing (no ClearType) and monochrome
+emoji, and lays out Arabic and Hebrew left to right without shaping.
+
 ## Debugging
 
 ```bash
@@ -102,6 +172,11 @@ RUST_LOG=mdread=debug mdread file.md            # parse timing, image errors
 RUST_LOG=mdread=trace mdread file.md            # per-frame timing
 mdread --screenshot out.png --screenshot-delay 1500 file.md   # headless-ish capture
 ```
+
+In PowerShell: `$env:RUST_LOG = 'mdread=debug'; mdread file.md`. Release builds
+on Windows have no console, so the log goes to `%LOCALAPPDATA%\mdread\mdread.log`
+(debug builds from `cargo run` keep one). Startup errors and crashes are shown
+in a message box and appended to `%LOCALAPPDATA%\mdread\crash.log`.
 
 ## License
 

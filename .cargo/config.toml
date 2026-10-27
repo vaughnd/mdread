@@ -1,0 +1,9 @@
+# Link the MSVC C runtime statically so mdread.exe runs on machines without the
+# Visual C++ Redistributable (Windows ships the UCRT, but not vcruntime140.dll).
+# The cc crate picks this up too and builds bundled C code (ring) with /MT.
+# Note: `cargo install` from outside this checkout does not read this file.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

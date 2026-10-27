@@ -7,11 +7,18 @@ mod document;
 mod files;
 mod fonts;
 mod highlight;
+mod links;
 mod render;
 mod search;
+#[cfg(windows)]
+mod svg_loader;
+mod text;
 mod theme;
+#[cfg(windows)]
+mod win;
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 use app::{Args, ThemeChoice};
 
@@ -35,6 +42,30 @@ ENVIRONMENT:
     MDREAD_MONO_FONT     Path to a .ttf/.otf to use for code
 ";
 
+/// Makes stdout/stderr reach the terminal before printing. Release builds on Windows
+/// have no console of their own; returns false if there is none to borrow either.
+pub fn cli_console() -> bool {
+    #[cfg(windows)]
+    return win::attach_console();
+    #[cfg(not(windows))]
+    true
+}
+
+/// Prints CLI output (help, version, usage errors) and exits. On Windows, without a
+/// terminal to print to, the text is shown in a message box instead.
+fn exit_with(text: &str, code: i32) -> ! {
+    use std::io::Write;
+    if cli_console() {
+        // Not print!: it panics when the reader has gone away (`mdread --help | head -1`).
+        let mut out: Box<dyn Write> = if code == 0 { Box::new(std::io::stdout()) } else { Box::new(std::io::stderr()) };
+        let _ = out.write_all(text.as_bytes()).and_then(|_| out.flush());
+    } else {
+        #[cfg(windows)]
+        win::message_box(text.trim_end(), code != 0);
+    }
+    std::process::exit(code);
+}
+
 fn parse_args() -> Args {
     let mut args = Args { screenshot_delay_ms: 1500, ..Args::default() };
     let mut it = std::env::args_os().skip(1);
@@ -46,61 +77,159 @@ fn parse_args() -> Args {
             "--screenshot-delay" => {
                 args.screenshot_delay_ms = it.next().and_then(|v| v.to_string_lossy().parse().ok()).unwrap_or(1500);
             }
-            "-h" | "--help" => {
-                print!("{HELP}");
-                std::process::exit(0);
-            }
-            "-V" | "--version" => {
-                println!("mdread {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
+            "-h" | "--help" => exit_with(HELP, 0),
+            "-V" | "--version" => exit_with(&format!("mdread {}\n", env!("CARGO_PKG_VERSION")), 0),
             "--dark" => args.theme = Some(ThemeChoice::Dark),
             "--light" => args.theme = Some(ThemeChoice::Light),
             "--system" => args.theme = Some(ThemeChoice::System),
             "-" => args.stdin = true,
-            _ if s.starts_with("--") => {
-                eprintln!("unknown option {s}\n{HELP}");
-                std::process::exit(2);
-            }
+            _ if s.starts_with("--") => exit_with(&format!("unknown option {s}\n{HELP}\n"), 2),
             _ => {
-                // Allow `file.md#section` to open straight at a heading.
-                if let Some((file, frag)) = s.split_once('#') {
-                    if !std::path::Path::new(s.as_ref()).exists() && std::path::Path::new(file).exists() {
-                        args.files.push(PathBuf::from(file));
-                        args.anchor = Some(frag.to_owned());
-                        continue;
-                    }
+                let (file, anchor) = split_anchor(&a, |p| p.exists());
+                args.files.push(file);
+                if anchor.is_some() {
+                    args.anchor = anchor;
                 }
-                args.files.push(PathBuf::from(a));
             }
         }
     }
     args
 }
 
-/// Window icon, used for `_NET_WM_ICON` on X11, the Dock on macOS and the task bar on
-/// Windows. Wayland compositors ignore it and take the icon from the desktop entry that
+/// Splits `file.md#section` so the viewer can open straight at a heading. Splits at the
+/// last `#`, and only when the whole argument is not an existing path but the part before
+/// the `#` is, so names like `C#/notes.md` or `issue#12.md` keep working.
+fn split_anchor(arg: &OsStr, exists: impl Fn(&Path) -> bool) -> (PathBuf, Option<String>) {
+    if let Some((file, frag)) = arg.to_str().and_then(|s| s.rsplit_once('#')) {
+        if !exists(Path::new(arg)) && exists(Path::new(file)) {
+            return (PathBuf::from(file), Some(frag.to_owned()));
+        }
+    }
+    (PathBuf::from(arg), None)
+}
+
+/// Window icon, used for `_NET_WM_ICON` on X11, the Dock on macOS and the title bar and
+/// task bar button on Windows (Explorer and shortcuts use the icon resource that build.rs
+/// embeds). Wayland compositors ignore it and take the icon from the desktop entry that
 /// matches the app id instead, which `install.sh` installs together with the icon files.
 fn app_icon() -> egui::IconData {
     eframe::icon_data::from_png_bytes(include_bytes!("../assets/icons/hicolor/256x256/apps/mdread.png"))
         .expect("embedded icon PNG is valid")
 }
 
+fn init_logging() {
+    let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"));
+    // Release builds on Windows have no stderr; send RUST_LOG output to a file instead.
+    #[cfg(windows)]
+    if !cfg!(debug_assertions) && std::env::var_os("RUST_LOG").is_some() {
+        if let Some((file, _)) = win::open_log("mdread.log") {
+            use std::io::Write;
+            builder.target(env_logger::Target::Pipe(Box::new(file))).format(|buf, r| {
+                writeln!(buf, "[{} {} {:5} {}] {}", win::timestamp(), std::process::id(), r.level(), r.target(), r.args())
+            });
+        }
+    }
+    builder.init();
+}
+
+fn native_options() -> eframe::NativeOptions {
+    const SIZE: egui::Vec2 = egui::vec2(1500.0, 1250.0);
+    let viewport = egui::ViewportBuilder::default()
+        .with_title("mdread")
+        .with_app_id("mdread")
+        .with_icon(app_icon())
+        .with_inner_size(SIZE)
+        .with_min_inner_size([420.0, 300.0]);
+    // eframe only clamps the first-run size to the whole monitor, which leaves the bottom
+    // of the window under the taskbar on typical laptop screens.
+    #[cfg(windows)]
+    let viewport = match win::first_run_geometry(SIZE) {
+        Some((pos, size)) => viewport.with_position(pos).with_inner_size(size),
+        None => viewport,
+    };
+    eframe::NativeOptions { viewport, persist_window: true, ..Default::default() }
+}
+
+fn run(native_options: eframe::NativeOptions, args: Args) -> eframe::Result {
+    eframe::run_native(
+        "mdread",
+        native_options,
+        Box::new(move |cc| {
+            #[cfg(windows)]
+            win::disarm_renderer_fallback();
+            Ok(Box::new(app::App::new(cc, args)))
+        }),
+    )
+}
+
+/// Starts with glow and retries with wgpu (DX12, or WARP where there is no GPU driver)
+/// if glow fails before the window is up, e.g. in VMs and RDP sessions that only offer
+/// OpenGL 1.1. `MDREAD_RENDERER=glow|wgpu` (any case) forces one renderer; any other
+/// value is ignored with a warning.
+#[cfg(windows)]
+fn run_windows(args: Args) -> eframe::Result {
+    let forced = std::env::var(win::RENDERER_ENV).ok().map(|v| v.trim().to_ascii_lowercase());
+    let forced = match forced.as_deref() {
+        Some("glow" | "wgpu") | None => forced,
+        Some(v) => {
+            log::warn!("ignoring {}={v:?}; expected glow or wgpu", win::RENDERER_ENV);
+            None
+        }
+    };
+    if forced.as_deref() != Some("wgpu") {
+        win::arm_renderer_fallback(forced.is_none());
+        let result = run(eframe::NativeOptions { renderer: eframe::Renderer::Glow, ..native_options() }, args.clone());
+        match result {
+            Err(e) if win::disarm_renderer_fallback() => log::warn!("glow renderer failed ({e}); retrying with wgpu"),
+            r => return r,
+        }
+    }
+    run(eframe::NativeOptions { renderer: eframe::Renderer::Wgpu, ..native_options() }, args)
+}
+
 fn main() -> eframe::Result {
     let launched = std::time::Instant::now();
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    #[cfg(windows)]
+    win::install_panic_hook();
+    init_logging();
     let mut args = parse_args();
     args.launched = Some(launched);
 
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("mdread")
-            .with_app_id("mdread")
-            .with_icon(app_icon())
-            .with_inner_size([1500.0, 1250.0])
-            .with_min_inner_size([420.0, 300.0]),
-        persist_window: true,
-        ..Default::default()
-    };
-    eframe::run_native("mdread", native_options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, args)))))
+    #[cfg(not(windows))]
+    let result = run(native_options(), args);
+    #[cfg(windows)]
+    let result = run_windows(args);
+    #[cfg(windows)]
+    if let Err(e) = &result {
+        win::report_fatal(&format!("mdread stopped with an error:\n{e}"), &format!("run_native failed: {e:?}"));
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn split(arg: &str, existing: &[&str]) -> (PathBuf, Option<String>) {
+        split_anchor(OsStr::new(arg), |p| existing.iter().any(|e| Path::new(e) == p))
+    }
+
+    #[test]
+    fn anchor_is_split_off_an_existing_file() {
+        assert_eq!(split("docs/guide.md#install", &["docs/guide.md"]), (PathBuf::from("docs/guide.md"), Some("install".into())));
+        assert_eq!(split(r"C:\x.md#h", &[r"C:\x.md"]), (PathBuf::from(r"C:\x.md"), Some("h".into())));
+    }
+
+    #[test]
+    fn hash_in_directory_or_file_name_is_kept() {
+        assert_eq!(split(r"C:\src\C#\notes.md#intro", &[r"C:\src\C#\notes.md"]), (PathBuf::from(r"C:\src\C#\notes.md"), Some("intro".into())));
+        assert_eq!(split("src/C#/notes.md", &["src/C#/notes.md"]), (PathBuf::from("src/C#/notes.md"), None));
+        assert_eq!(split("issue#12.md", &["issue#12.md", "issue"]), (PathBuf::from("issue#12.md"), None));
+    }
+
+    #[test]
+    fn missing_files_are_passed_through_unchanged() {
+        assert_eq!(split("missing.md#top", &[]), (PathBuf::from("missing.md#top"), None));
+        assert_eq!(split("plain.md", &[]), (PathBuf::from("plain.md"), None));
+    }
 }

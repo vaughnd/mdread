@@ -1,10 +1,12 @@
 //! Application state, input handling and the top-level layout
 //! (outline sidebar · reading column · file sidebar · status bar).
 
-use std::path::{Component, Path, PathBuf};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use egui::scroll_area::{DragScroll, ScrollSource};
 use egui::style::ScrollAnimation;
@@ -18,12 +20,14 @@ use egui::{
 use notify::Watcher;
 use serde::{Deserialize, Serialize};
 
-use crate::document::{percent_decode, Block, Document, InlineItem};
+use crate::document::{Block, Document, InlineItem};
 use crate::files;
 use crate::fonts::{self, FontSet};
 use crate::highlight::{self, Highlighter};
+use crate::links::{self, Target};
 use crate::render::{Action, RenderCtx};
 use crate::search::SearchState;
+use crate::text;
 use crate::theme::{self, Palette};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,7 +63,7 @@ impl Default for Settings {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Args {
     pub files: Vec<PathBuf>,
     pub stdin: bool,
@@ -73,6 +77,27 @@ pub struct Args {
     /// `--find TERM`: open with the search box filled in.
     pub find: Option<String>,
 }
+
+enum WatchEvent {
+    /// The open file changed.
+    Changed,
+    /// The file changed without a watcher event (Windows): notify silently stops watching
+    /// after an error or a buffer overflow, so start a new watcher.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Missed,
+}
+
+/// Size and modification time of the open file.
+type FileStamp = (u64, SystemTime);
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+/// How often the open file's stamp is checked on Windows, as a fallback for the watcher.
+#[cfg(windows)]
+const STAMP_POLL: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Default)]
 struct Measure {
@@ -148,9 +173,17 @@ pub struct App {
     history_pos: usize,
 
     watcher: Option<notify::RecommendedWatcher>,
-    watch_rx: Option<mpsc::Receiver<()>>,
+    watch_rx: Option<mpsc::Receiver<WatchEvent>>,
+    /// Stops the stamp poller of the previous watcher.
+    watch_alive: Arc<AtomicBool>,
+    /// Stamp of the file as last read.
+    seen: Arc<egui::mutex::Mutex<Option<FileStamp>>>,
     reload_at: Option<Instant>,
+    reload_retries: u32,
     dialog_rx: Option<mpsc::Receiver<Option<PathBuf>>>,
+    /// Errors from opening links in other apps.
+    launch_tx: mpsc::Sender<String>,
+    launch_rx: mpsc::Receiver<String>,
 
     files: Vec<PathBuf>,
     files_dir: Option<PathBuf>,
@@ -168,14 +201,22 @@ pub struct App {
     screenshot: Option<PathBuf>,
     screenshot_delay_ms: u64,
     screenshot_requested: bool,
+    /// Whether the title bar was last made dark (Windows; None before the first frame).
+    #[cfg(windows)]
+    title_bar_dark: Option<bool>,
 }
+
+/// What a folder link opens, in this order.
+const FOLDER_INDEX: &[&str] = &["README.md", "readme.md", "index.md", "README.markdown"];
 
 /// Label for the primary shortcut modifier: egui's `Modifiers::COMMAND` is Cmd on macOS
 /// and Ctrl everywhere else.
 const CMD: &str = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" };
 
 /// Shell command that prints the chosen file path on stdout, or nothing if cancelled.
-/// macOS uses the native panel through `osascript`; elsewhere `zenity` (GTK).
+/// macOS uses the native panel through `osascript`; elsewhere `zenity` (GTK). Windows
+/// uses the native dialog through rfd instead.
+#[cfg(not(windows))]
 fn file_dialog_command(start_dir: Option<&Path>) -> std::process::Command {
     if cfg!(target_os = "macos") {
         let mut script = String::from(
@@ -214,6 +255,8 @@ impl App {
         if let Some(t) = args.theme {
             settings.theme = t;
         }
+        #[cfg(windows)]
+        crate::svg_loader::install(ctx);
         egui_extras::install_image_loaders(ctx);
         highlight::preload();
         let fonts = fonts::install(ctx);
@@ -227,6 +270,7 @@ impl App {
         };
         let pal = if dark { Palette::dark() } else { Palette::light() };
         theme::apply(ctx, &pal, &fonts, settings.base_size);
+        let (launch_tx, launch_rx) = mpsc::channel();
 
         let mut app = Self {
             settings,
@@ -261,8 +305,13 @@ impl App {
             history_pos: 0,
             watcher: None,
             watch_rx: None,
+            watch_alive: Arc::new(AtomicBool::new(false)),
+            seen: Arc::new(egui::mutex::Mutex::new(None)),
             reload_at: None,
+            reload_retries: 0,
             dialog_rx: None,
+            launch_tx,
+            launch_rx,
             files: Vec::new(),
             files_dir: None,
             files_rx: None,
@@ -277,14 +326,25 @@ impl App {
             screenshot: args.screenshot.clone(),
             screenshot_delay_ms: args.screenshot_delay_ms,
             screenshot_requested: false,
+            #[cfg(windows)]
+            title_bar_dark: None,
         };
 
         if args.stdin {
-            let mut s = String::new();
             use std::io::Read;
-            let _ = std::io::stdin().read_to_string(&mut s);
             app.stdin_mode = true;
-            app.set_document(s, None, ctx);
+            let mut bytes = Vec::new();
+            match std::io::stdin().read_to_end(&mut bytes) {
+                Ok(n) if n > 0 => {
+                    let decoded = text::decode(bytes);
+                    app.set_document(decoded.text, None, ctx);
+                    if let Some(enc) = decoded.encoding {
+                        app.set_status(format!("Decoded as {enc}"));
+                    }
+                }
+                Ok(_) => app.error = Some("No input on stdin".into()),
+                Err(e) => app.error = Some(format!("Cannot read stdin: {e}")),
+            }
         } else if let Some(p) = args.files.first() {
             app.load_path(p.clone(), true, ctx);
             app.pending_anchor = args.anchor.clone();
@@ -303,6 +363,7 @@ impl App {
 
     fn set_document(&mut self, text: String, path: Option<PathBuf>, ctx: &Context) {
         let t0 = Instant::now();
+        fonts::add_script_fallbacks(ctx, &self.fonts, &text);
         let doc = Document::parse(&text);
         log::debug!("parsed {} bytes into {} blocks in {:.2} ms", text.len(), doc.blocks.len(), t0.elapsed().as_secs_f64() * 1000.0);
         self.gen += 1;
@@ -327,10 +388,15 @@ impl App {
     }
 
     fn load_path(&mut self, path: PathBuf, push_history: bool, ctx: &Context) {
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        // dunce leaves out the `\\?\` prefix Windows puts on canonical paths. Some virtual
+        // drives cannot be canonicalized; an absolute path still gives the folder links
+        // and the sidebar start from.
+        let path = dunce::canonicalize(&path).or_else(|_| std::path::absolute(&path)).unwrap_or(path);
+        let stamp = file_stamp(&path);
         match std::fs::read(&path) {
             Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes).into_owned();
+                let decoded = text::decode(bytes);
+                *self.seen.lock() = stamp;
                 if push_history {
                     if let Some(cur) = self.history.get_mut(self.history_pos) {
                         cur.1 = self.scroll_offset;
@@ -342,9 +408,13 @@ impl App {
                     self.history_pos = self.history.len() - 1;
                 }
                 self.stdin_mode = false;
-                self.set_document(text, Some(path.clone()), ctx);
+                self.set_document(decoded.text, Some(path.clone()), ctx);
+                if let Some(enc) = decoded.encoding {
+                    self.set_status(format!("Decoded as {enc}"));
+                }
                 self.pending_offset = Some(0.0);
                 self.jump = None;
+                self.reload_retries = 0;
                 self.setup_watcher(&path, ctx);
                 let dir = path.parent().map(Path::to_path_buf);
                 if dir != self.files_dir {
@@ -356,7 +426,7 @@ impl App {
                 }
             }
             Err(e) => {
-                self.error = Some(format!("Cannot read {}: {e}", path.display()));
+                self.error = Some(format!("Cannot read {}: {e}", links::display_path(&path)));
                 self.doc = None;
                 self.path = Some(path);
                 ctx.send_viewport_cmd(ViewportCommand::Title("mdread".into()));
@@ -366,9 +436,12 @@ impl App {
 
     fn reload(&mut self, ctx: &Context, announce: bool) {
         let Some(path) = self.path.clone() else { return };
+        let stamp = file_stamp(&path);
         match std::fs::read(&path) {
             Ok(bytes) => {
-                let text = String::from_utf8_lossy(&bytes).into_owned();
+                self.reload_retries = 0;
+                *self.seen.lock() = stamp;
+                let text = text::decode(bytes).text;
                 if text == self.source {
                     return;
                 }
@@ -379,24 +452,45 @@ impl App {
                     self.set_status("Reloaded");
                 }
             }
-            Err(e) => self.set_status(format!("Reload failed: {e}")),
+            Err(e) if is_transient_read_error(&e) && self.reload_retries < 4 => {
+                self.reload_retries += 1;
+                let delay = Duration::from_millis(50 << self.reload_retries);
+                log::debug!("reload {}: {e}; retrying in {delay:?}", path.display());
+                self.reload_at = Some(Instant::now() + delay);
+                wake_after(ctx, delay + Duration::from_millis(5));
+            }
+            Err(e) => {
+                self.reload_retries = 0;
+                self.set_status(format!("Reload failed: {e}"));
+            }
         }
     }
 
     fn setup_watcher(&mut self, path: &Path, ctx: &Context) {
         self.watcher = None;
         self.watch_rx = None;
+        self.watch_alive.store(false, Ordering::Relaxed);
         let Some(dir) = path.parent() else { return };
         let (tx, rx) = mpsc::channel();
+        self.watch_rx = Some(rx);
+        #[cfg(windows)]
+        self.spawn_stamp_poller(path, tx.clone(), ctx);
         let target = path.to_path_buf();
         let ctx = ctx.clone();
-        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if let Ok(ev) = res {
-                let relevant = ev.paths.is_empty() || ev.paths.iter().any(|p| p == &target);
-                if relevant && tx.send(()).is_ok() {
+        let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+            Ok(ev) => {
+                let relevant = ev.paths.is_empty() || ev.paths.iter().any(|p| is_watched_file(p, &target));
+                if relevant && tx.send(WatchEvent::Changed).is_ok() {
                     ctx.request_repaint();
                 }
             }
+            Err(e) if cfg!(windows) => {
+                log::warn!("file watcher: {e}");
+                if tx.send(WatchEvent::Missed).is_ok() {
+                    ctx.request_repaint();
+                }
+            }
+            Err(_) => {}
         });
         match watcher {
             Ok(mut w) => {
@@ -404,25 +498,76 @@ impl App {
                     log::warn!("watch {}: {e}", dir.display());
                 } else {
                     self.watcher = Some(w);
-                    self.watch_rx = Some(rx);
                 }
             }
             Err(e) => log::warn!("file watcher unavailable: {e}"),
         }
     }
 
-    fn open_dialog(&mut self, ctx: &Context) {
+    /// Checks the file's size and modification time every few seconds. Catches what
+    /// ReadDirectoryChangesW misses: notify stops watching without a word after an error
+    /// or a buffer overflow, and changes made on network shares and in WSL often never
+    /// arrive. Only stat calls; nothing is read or repainted unless the file changed.
+    #[cfg(windows)]
+    fn spawn_stamp_poller(&mut self, path: &Path, tx: mpsc::Sender<WatchEvent>, ctx: &Context) {
+        let alive = Arc::new(AtomicBool::new(true));
+        self.watch_alive = alive.clone();
+        let seen = self.seen.clone();
+        let path = path.to_path_buf();
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("file-poll".into())
+            .spawn(move || loop {
+                std::thread::sleep(STAMP_POLL);
+                if !alive.load(Ordering::Relaxed) {
+                    return;
+                }
+                let now = file_stamp(&path);
+                let mut seen = seen.lock();
+                if *seen != now {
+                    *seen = now;
+                    if tx.send(WatchEvent::Missed).is_err() {
+                        return;
+                    }
+                    ctx.request_repaint();
+                }
+            })
+            .ok();
+    }
+
+    fn open_dialog(&mut self, ctx: &Context, frame: &eframe::Frame) {
         if self.dialog_rx.is_some() {
             return;
         }
         let (tx, rx) = mpsc::channel();
         let ctx = ctx.clone();
         let start_dir = self.files_dir.clone();
+        // The native Open dialog, owned by the window so it stays on top of it and keeps it
+        // disabled while open. It runs on the helper thread: its modal loop would stall
+        // the event loop here.
+        #[cfg(windows)]
+        let dialog = {
+            let dialog = rfd::FileDialog::new()
+                .set_title("Open Markdown file")
+                .add_filter("Markdown", &["md", "markdown", "mdown", "mkd", "mdx", "txt"])
+                .add_filter("All files", &["*"])
+                .set_parent(frame);
+            match &start_dir {
+                Some(d) => dialog.set_directory(dunce::simplified(d)),
+                None => dialog,
+            }
+        };
+        #[cfg(not(windows))]
+        let _ = frame;
         std::thread::Builder::new()
             .name("file-dialog".into())
             .spawn(move || {
-                let out = file_dialog_command(start_dir.as_deref()).output().ok();
-                let path = out
+                #[cfg(windows)]
+                let path = dialog.pick_file();
+                #[cfg(not(windows))]
+                let path = file_dialog_command(start_dir.as_deref())
+                    .output()
+                    .ok()
                     .filter(|o| o.status.success())
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
                     .filter(|s| !s.is_empty())
@@ -432,6 +577,37 @@ impl App {
             })
             .ok();
         self.dialog_rx = Some(rx);
+    }
+
+    /// Opens a file dropped on the window. On Windows a dropped shortcut opens its target,
+    /// and a dropped folder its README or first Markdown file: reading a folder as a file
+    /// fails there with a puzzling "Access is denied".
+    fn open_dropped(&mut self, path: PathBuf, ctx: &Context) {
+        #[cfg(windows)]
+        let path = {
+            let mut path = path;
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
+                let _com = crate::win::ComApartment::init();
+                match crate::win::shortcut_target(&path) {
+                    Some(target) => path = target,
+                    None => {
+                        self.set_status(format!("{} does not point to a file", links::display_path(&path)));
+                        return;
+                    }
+                }
+            }
+            if path.is_dir() {
+                match markdown_in_folder(&path) {
+                    Some(file) => path = file,
+                    None => {
+                        self.set_status(format!("No Markdown files in {}", links::display_path(&path)));
+                        return;
+                    }
+                }
+            }
+            path
+        };
+        self.load_path(path, true, ctx);
     }
 
     fn set_status(&mut self, s: impl Into<String>) {
@@ -463,37 +639,40 @@ impl App {
     }
 
     fn open_link(&mut self, url: &str, ctx: &Context) {
-        let url = url.trim();
-        if url.is_empty() {
-            return;
-        }
-        if let Some(anchor) = url.strip_prefix('#') {
-            let target = self.doc.as_ref().and_then(|d| d.find_slug(anchor));
-            match target {
-                Some(b) => self.jump_to_block(b),
-                None => self.set_status(format!("Anchor not found: #{anchor}")),
+        let base = self.link_base();
+        match links::classify_link(url, base.as_deref()) {
+            None => {}
+            Some(Target::Anchor(anchor)) => {
+                let target = self.doc.as_ref().and_then(|d| d.find_slug(&anchor));
+                match target {
+                    Some(b) => self.jump_to_block(b),
+                    None => self.set_status(format!("Anchor not found: #{anchor}")),
+                }
             }
-            return;
-        }
-        if url.contains("://") || url.starts_with("mailto:") || url.starts_with("www.") {
-            open_external(url);
-            self.set_status(format!("Opened {url}"));
-            return;
-        }
-        let (path_part, frag) = match url.split_once('#') {
-            Some((p, f)) => (p, Some(f.to_owned())),
-            None => (url, None),
-        };
-        let rel = percent_decode(path_part);
-        let abs = self.resolve_local(&rel);
-        if rel.is_empty() {
-            if let Some(f) = frag {
-                self.open_link(&format!("#{f}"), ctx);
+            Some(Target::External(url)) => {
+                self.launch(url.clone(), false, ctx);
+                self.set_status(format!("Opened {url}"));
             }
-            return;
+            Some(Target::Blocked(msg)) => self.set_status(msg),
+            Some(Target::Local(abs, frag)) => self.open_local(abs, frag, ctx),
         }
+    }
+
+    /// The folder relative links start from: the document's, or with stdin the current
+    /// folder, which a terminal set (stdin is only ever piped from one).
+    fn link_base(&self) -> Option<PathBuf> {
+        if self.stdin_mode {
+            return std::env::current_dir().ok();
+        }
+        self.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf)
+    }
+
+    fn open_local(&mut self, abs: PathBuf, frag: Option<String>, ctx: &Context) {
+        // Resolve `..` and links first, so the type check below sees the real file.
+        #[cfg(windows)]
+        let abs = dunce::canonicalize(&abs).unwrap_or(abs);
         if abs.is_dir() {
-            for name in ["README.md", "readme.md", "index.md", "README.markdown"] {
+            for name in FOLDER_INDEX {
                 let p = abs.join(name);
                 if p.is_file() {
                     self.load_path(p, true, ctx);
@@ -501,63 +680,39 @@ impl App {
                     return;
                 }
             }
-            open_external(&abs.display().to_string());
+            self.launch(abs, false, ctx);
             return;
         }
         if abs.is_file() {
             if files::is_markdown(&abs) || abs.extension().is_none() {
                 self.load_path(abs, true, ctx);
                 self.pending_anchor = frag;
+            } else if links::opens_in_default_app(&abs) {
+                self.set_status(format!("Opened {}", links::display_path(&abs)));
+                self.launch(abs, false, ctx);
             } else {
-                open_external(&abs.display().to_string());
-                self.set_status(format!("Opened {}", abs.display()));
+                // Could be a program or script: show it instead of running it.
+                let name = abs.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.set_status(format!("Showing {name} in Explorer"));
+                self.launch(abs, true, ctx);
             }
         } else {
-            self.set_status(format!("Not found: {}", abs.display()));
+            self.set_status(format!("Not found: {}", links::display_path(&abs)));
         }
-    }
-
-    /// Absolute path for a link written relative to the current document,
-    /// with `.` and `..` segments folded.
-    fn resolve_local(&self, rel: &str) -> PathBuf {
-        let joined = if Path::new(rel).is_absolute() {
-            PathBuf::from(rel)
-        } else {
-            let base = self.path.as_ref().and_then(|p| p.parent()).map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("."));
-            base.join(rel)
-        };
-        let mut out = PathBuf::new();
-        for c in joined.components() {
-            match c {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    if !out.pop() && !out.has_root() {
-                        out.push(c);
-                    }
-                }
-                _ => out.push(c),
-            }
-        }
-        out
     }
 
     /// The link as it should read outside the viewer: web links and anchors as
     /// written, relative file links as absolute paths.
     fn link_for_clipboard(&self, url: &str) -> String {
-        let url = url.trim();
-        if url.starts_with('#') || url.contains("://") || url.starts_with("mailto:") || url.starts_with("www.") {
-            return url.to_owned();
-        }
-        let (path_part, frag) = url.split_once('#').unwrap_or((url, ""));
-        let rel = percent_decode(path_part);
-        if rel.is_empty() {
-            return url.to_owned();
-        }
-        let abs = self.resolve_local(&rel);
-        if frag.is_empty() {
-            abs.display().to_string()
-        } else {
-            format!("{}#{frag}", abs.display())
+        match links::classify_link(url, self.link_base().as_deref()) {
+            Some(Target::Local(abs, frag)) => {
+                let abs = links::display_path(&abs);
+                match frag {
+                    Some(f) if !f.is_empty() => format!("{abs}#{f}"),
+                    _ => abs,
+                }
+            }
+            _ => url.trim().to_owned(),
         }
     }
 
@@ -676,14 +831,24 @@ impl App {
             }
             MenuItem::OpenImage => {
                 if let Some(uri) = &menu.image {
-                    let target = local_path(uri);
-                    open_external(target);
-                    self.set_status(format!("Opened {target}"));
+                    // Windows hands the file to the shell, so it gets the checks a click on a
+                    // link gets: only safe types open, the rest is revealed in Explorer.
+                    #[cfg(windows)]
+                    match links::file_uri_to_path(uri) {
+                        Some(path) => self.open_local(path, None, ctx),
+                        None => self.open_link(uri, ctx),
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let target = local_path(uri);
+                        self.launch(target, false, ctx);
+                        self.set_status(format!("Opened {target}"));
+                    }
                 }
             }
             MenuItem::CopyImage => {
                 if let Some(uri) = &menu.image {
-                    ctx.copy_text(local_path(uri).to_owned());
+                    ctx.copy_text(image_address(uri));
                     self.set_status("Copied image address to clipboard");
                 }
             }
@@ -694,6 +859,40 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Opens a URL or path with the OS (or, with `reveal`, shows the file in Explorer) on a
+    /// helper thread, as the shell can block. Failures come back to the status bar.
+    fn launch(&self, target: impl Into<OsString>, reveal: bool, ctx: &Context) {
+        let target: OsString = target.into();
+        let tx = self.launch_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("open".into())
+            .spawn(move || {
+                #[cfg(windows)]
+                let result = {
+                    let _com = crate::win::ComApartment::init();
+                    if reveal {
+                        crate::win::reveal_in_explorer(Path::new(&target))
+                    } else {
+                        open::that_detached(&target)
+                    }
+                };
+                #[cfg(not(windows))]
+                let result = {
+                    let _ = reveal;
+                    open::that_detached(&target)
+                };
+                if let Err(e) = result {
+                    let label = links::display_path(Path::new(&target));
+                    log::warn!("open {label}: {e}");
+                    if tx.send(format!("Could not open {label}: {e}")).is_ok() {
+                        ctx.request_repaint();
+                    }
+                }
+            })
+            .ok();
     }
 
     // ------------------------------------------------------------------
@@ -717,6 +916,19 @@ impl App {
         self.apply_theme(ctx);
     }
 
+    /// Gives the Windows title bar the app's theme, which can differ from the system's.
+    #[cfg(windows)]
+    fn sync_title_bar(&mut self, frame: &eframe::Frame) {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        if self.title_bar_dark == Some(self.pal.dark) {
+            return;
+        }
+        if let Ok(RawWindowHandle::Win32(w)) = frame.window_handle().map(|h| h.as_raw()) {
+            crate::win::set_title_bar_dark(w.hwnd.get(), self.pal.dark);
+            self.title_bar_dark = Some(self.pal.dark);
+        }
+    }
+
     fn zoom_to(&mut self, ctx: &Context, zoom: f32) {
         let zoom = zoom.clamp(0.5, 3.0);
         ctx.set_zoom_factor(zoom);
@@ -727,11 +939,11 @@ impl App {
     // Input
     // ------------------------------------------------------------------
 
-    fn handle_input(&mut self, ctx: &Context) {
+    fn handle_input(&mut self, ctx: &Context, frame: &eframe::Frame) {
         // Dropped files
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         if let Some(p) = dropped.into_iter().next() {
-            self.load_path(p, true, ctx);
+            self.open_dropped(p, ctx);
         }
 
         let menu_open = self.menu.is_some();
@@ -746,141 +958,34 @@ impl App {
         let mut zoom: Option<f32> = None;
         let cur_zoom = ctx.zoom_factor();
 
-        enum Cmd {
-            Open,
-            Quit,
-            Search,
-            Reload,
-            Back,
-            Forward,
-            Escape,
-            Top,
-            Bottom,
-            Next,
-            Prev,
-            Outline,
-            Files,
-            Theme,
-            Width,
-            Narrower,
-            Wider,
-            Help,
-            ZoomReset,
-        }
         let mut cmds: Vec<Cmd> = Vec::new();
-
         ctx.input_mut(|i| {
             let zd = i.zoom_delta();
             if (zd - 1.0).abs() > 1e-4 {
                 zoom = Some(cur_zoom * zd);
             }
-            let cmd = Modifiers::COMMAND;
-            if i.consume_key(cmd, Key::O) {
-                cmds.push(Cmd::Open);
-            }
-            if i.consume_key(cmd, Key::Q) || i.consume_key(cmd, Key::W) {
-                cmds.push(Cmd::Quit);
-            }
-            if i.consume_key(cmd, Key::F) {
-                cmds.push(Cmd::Search);
-            }
-            if i.consume_key(cmd, Key::R) || i.consume_key(Modifiers::NONE, Key::F5) {
-                cmds.push(Cmd::Reload);
-            }
-            if i.consume_key(Modifiers::ALT, Key::ArrowLeft) {
-                cmds.push(Cmd::Back);
-            }
-            if i.consume_key(Modifiers::ALT, Key::ArrowRight) {
-                cmds.push(Cmd::Forward);
-            }
-            if i.consume_key(Modifiers::NONE, Key::F3) {
-                cmds.push(Cmd::Next);
-            }
-            if i.consume_key(Modifiers::SHIFT, Key::F3) {
-                cmds.push(Cmd::Prev);
-            }
-            if i.consume_key(Modifiers::NONE, Key::F1) {
-                cmds.push(Cmd::Help);
-            }
-            if i.key_pressed(Key::Escape) {
-                cmds.push(Cmd::Escape);
-            }
-            if !typing {
-                if i.consume_key(Modifiers::NONE, Key::J) || i.key_pressed(Key::ArrowDown) {
-                    delta += line;
-                }
-                if i.consume_key(Modifiers::NONE, Key::K) || i.key_pressed(Key::ArrowUp) {
-                    delta -= line;
-                }
-                if i.consume_key(Modifiers::NONE, Key::Space) || i.key_pressed(Key::PageDown) {
-                    delta += page;
-                }
-                if i.consume_key(Modifiers::SHIFT, Key::Space) || i.key_pressed(Key::PageUp) {
-                    delta -= page;
-                }
-                if i.consume_key(Modifiers::NONE, Key::D) {
-                    delta += page * 0.5;
-                }
-                if i.consume_key(Modifiers::NONE, Key::U) {
-                    delta -= page * 0.5;
-                }
-                if i.consume_key(Modifiers::NONE, Key::G) || i.key_pressed(Key::Home) {
-                    cmds.push(Cmd::Top);
-                }
-                if i.consume_key(Modifiers::SHIFT, Key::G) || i.key_pressed(Key::End) {
-                    cmds.push(Cmd::Bottom);
-                }
-                if i.consume_key(Modifiers::NONE, Key::Slash) {
-                    cmds.push(Cmd::Search);
-                }
-                if i.consume_key(Modifiers::NONE, Key::N) {
-                    cmds.push(Cmd::Next);
-                }
-                if i.consume_key(Modifiers::SHIFT, Key::N) {
-                    cmds.push(Cmd::Prev);
-                }
-                if i.consume_key(Modifiers::NONE, Key::O) {
-                    cmds.push(Cmd::Outline);
-                }
-                if i.consume_key(Modifiers::NONE, Key::F) {
-                    cmds.push(Cmd::Files);
-                }
-                if i.consume_key(Modifiers::NONE, Key::T) {
-                    cmds.push(Cmd::Theme);
-                }
-                if i.consume_key(Modifiers::NONE, Key::W) {
-                    cmds.push(Cmd::Width);
-                }
-                if i.consume_key(Modifiers::NONE, Key::OpenBracket) {
-                    cmds.push(Cmd::Narrower);
-                }
-                if i.consume_key(Modifiers::NONE, Key::CloseBracket) {
-                    cmds.push(Cmd::Wider);
-                }
-                if i.consume_key(Modifiers::NONE, Key::Q) {
-                    cmds.push(Cmd::Quit);
-                }
-                if i.consume_key(Modifiers::NONE, Key::R) {
-                    cmds.push(Cmd::Reload);
-                }
-                if i.consume_key(Modifiers::SHIFT, Key::Questionmark) || i.consume_key(Modifiers::NONE, Key::Questionmark) {
-                    cmds.push(Cmd::Help);
-                }
-                if i.consume_key(Modifiers::NONE, Key::Backspace) {
+            cmds = key_commands(i, typing);
+            // The side buttons on the mouse, as in Explorer and browsers.
+            #[cfg(windows)]
+            {
+                if i.pointer.button_pressed(egui::PointerButton::Extra1) {
                     cmds.push(Cmd::Back);
                 }
-                if i.consume_key(Modifiers::NONE, Key::Plus) || i.consume_key(Modifiers::NONE, Key::Equals) || i.consume_key(Modifiers::SHIFT, Key::Equals) || i.consume_key(Modifiers::SHIFT, Key::Plus) {
-                    zoom = Some(cur_zoom * 1.1);
-                }
-                if i.consume_key(Modifiers::NONE, Key::Minus) {
-                    zoom = Some(cur_zoom / 1.1);
-                }
-                if i.consume_key(Modifiers::NONE, Key::Num0) {
-                    cmds.push(Cmd::ZoomReset);
+                if i.pointer.button_pressed(egui::PointerButton::Extra2) {
+                    cmds.push(Cmd::Forward);
                 }
             }
         });
 
+        for c in &cmds {
+            match *c {
+                Cmd::Lines(n) => delta += line * n,
+                Cmd::Pages(n) => delta += page * n,
+                Cmd::ZoomIn => zoom = Some(cur_zoom * 1.1),
+                Cmd::ZoomOut => zoom = Some(cur_zoom / 1.1),
+                _ => {}
+            }
+        }
         if delta != 0.0 {
             self.scroll_delta += delta;
         }
@@ -889,7 +994,8 @@ impl App {
         }
         for c in cmds {
             match c {
-                Cmd::Open => self.open_dialog(ctx),
+                Cmd::Lines(_) | Cmd::Pages(_) | Cmd::ZoomIn | Cmd::ZoomOut => {}
+                Cmd::Open => self.open_dialog(ctx, frame),
                 Cmd::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
                 Cmd::Search => {
                     self.search.open = true;
@@ -945,11 +1051,20 @@ impl App {
 
     fn poll_channels(&mut self, ctx: &Context) {
         if let Some(rx) = &self.watch_rx {
-            let mut changed = false;
-            while rx.try_recv().is_ok() {
-                changed = true;
+            let (mut changed, mut missed) = (false, false);
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    WatchEvent::Changed => changed = true,
+                    WatchEvent::Missed => missed = true,
+                }
             }
-            if changed {
+            if missed {
+                if let Some(path) = self.path.clone() {
+                    log::debug!("{} changed without a watcher event; watching again", path.display());
+                    self.setup_watcher(&path, ctx);
+                }
+            }
+            if changed || missed {
                 let at = Instant::now() + Duration::from_millis(60);
                 self.reload_at = Some(at);
                 wake_after(ctx, Duration::from_millis(70));
@@ -965,6 +1080,9 @@ impl App {
         }
         if self.hl.poll() {
             ctx.request_repaint();
+        }
+        while let Ok(msg) = self.launch_rx.try_recv() {
+            self.set_status(msg);
         }
         if let Some(rx) = &self.dialog_rx {
             match rx.try_recv() {
@@ -1249,7 +1367,7 @@ impl App {
                     let path_text = if self.stdin_mode {
                         "stdin".to_owned()
                     } else {
-                        self.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+                        self.path.as_deref().map(links::display_path).unwrap_or_default()
                     };
                     ui.add(Label::new(RichText::new(path_text).size(small).color(pal.text_dim)).truncate());
                     if let Some((msg, _)) = &self.status {
@@ -1300,7 +1418,7 @@ impl App {
                 let find_key = format!("{CMD}+F  /");
                 let zoom_key = format!("{CMD} + −  0   {CMD}+scroll");
                 let quit_key = format!("q  {CMD}+Q");
-                let rows: &[(&str, &str)] = &[
+                let mut rows: Vec<(&str, &str)> = vec![
                     (&open_key, "Open file"),
                     (&find_key, "Find in document"),
                     ("Enter  n  N", "Next / previous match"),
@@ -1320,8 +1438,11 @@ impl App {
                     ("Right-click", "Copy selection, open or copy link"),
                     (&quit_key, "Quit"),
                 ];
+                if cfg!(windows) {
+                    rows.insert(13, ("Mouse side buttons", "Back / forward"));
+                }
                 egui::Grid::new("help-grid").num_columns(2).spacing([24.0, 6.0]).show(ui, |ui| {
-                    for (k, v) in rows {
+                    for (k, v) in &rows {
                         ui.label(RichText::new(*k).monospace().color(pal.accent));
                         ui.label(RichText::new(*v).color(pal.text));
                         ui.end_row();
@@ -1517,6 +1638,7 @@ impl App {
         });
         if let Some(img) = shot {
             let [w, h] = img.size;
+            crate::cli_console();
             match image::save_buffer(&path, img.as_raw(), w as u32, h as u32, image::ColorType::Rgba8) {
                 Ok(()) => eprintln!("screenshot saved to {} ({w}x{h})", path.display()),
                 Err(e) => eprintln!("screenshot failed: {e}"),
@@ -1554,7 +1676,7 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.frames += 1;
         if self.frames == 1 {
@@ -1562,7 +1684,9 @@ impl eframe::App for App {
         }
         let frame_t0 = Instant::now();
         self.poll_channels(&ctx);
-        self.handle_input(&ctx);
+        self.handle_input(&ctx, frame);
+        #[cfg(windows)]
+        self.sync_title_bar(frame);
         self.handle_screenshot(&ctx);
 
         self.show_status_bar(ui);
@@ -1615,6 +1739,192 @@ impl eframe::App for App {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         self.pal.bg.to_normalized_gamma_f32()
     }
+}
+
+/// What the keyboard (or a mouse button) asks for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Cmd {
+    Open,
+    Quit,
+    Search,
+    Reload,
+    Back,
+    Forward,
+    Escape,
+    Top,
+    Bottom,
+    Next,
+    Prev,
+    Outline,
+    Files,
+    Theme,
+    Width,
+    Narrower,
+    Wider,
+    Help,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
+    /// Scroll by this many lines (negative: up).
+    Lines(f32),
+    /// Scroll by this many pages.
+    Pages(f32),
+}
+
+/// Whether the held modifiers fit a shortcut. As in egui, an extra Shift is fine, since
+/// some layouts need it to type '?', '/' or '+'; so a binding with Shift must be checked
+/// before the same key without it. On Windows an extra Alt is not: Alt+letter is a menu
+/// chord there, and Ctrl+Alt stands in for AltGr (Ctrl+Alt+Q types '@' on a German
+/// keyboard), so neither may reach the plain or Ctrl shortcuts. Real AltGr presses come
+/// without Ctrl and Alt: winit clears them.
+fn modifiers_fit(held: Modifiers, shortcut: Modifiers) -> bool {
+    held.matches_logically(shortcut) && (!cfg!(windows) || held.alt == shortcut.alt)
+}
+
+/// `InputState::consume_key`, with [`modifiers_fit`] deciding which presses count.
+fn consume(i: &mut egui::InputState, shortcut: Modifiers, key: Key) -> bool {
+    let before = i.events.len();
+    i.events.retain(|e| {
+        !matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. } if *k == key && modifiers_fit(*modifiers, shortcut))
+    });
+    i.events.len() != before
+}
+
+/// `InputState::key_pressed` for the navigation keys, which work with any of Ctrl and
+/// Shift held, but on Windows not with Alt.
+fn pressed(i: &egui::InputState, key: Key) -> bool {
+    i.events.iter().any(|e| matches!(e, egui::Event::Key { key: k, pressed: true, modifiers, .. } if *k == key && !(cfg!(windows) && modifiers.alt)))
+}
+
+/// Reads the shortcuts pressed this frame. Single-key shortcuts are off while a text
+/// field has focus (`typing`).
+fn key_commands(i: &mut egui::InputState, typing: bool) -> Vec<Cmd> {
+    let mut cmds = Vec::new();
+    let cmd = Modifiers::COMMAND;
+    let none = Modifiers::NONE;
+    let shift = Modifiers::SHIFT;
+    if consume(i, cmd, Key::O) {
+        cmds.push(Cmd::Open);
+    }
+    if consume(i, cmd, Key::Q) || consume(i, cmd, Key::W) {
+        cmds.push(Cmd::Quit);
+    }
+    if consume(i, cmd, Key::F) {
+        cmds.push(Cmd::Search);
+    }
+    if consume(i, cmd, Key::R) || consume(i, none, Key::F5) {
+        cmds.push(Cmd::Reload);
+    }
+    if consume(i, Modifiers::ALT, Key::ArrowLeft) {
+        cmds.push(Cmd::Back);
+    }
+    if consume(i, Modifiers::ALT, Key::ArrowRight) {
+        cmds.push(Cmd::Forward);
+    }
+    // Shifted bindings go first everywhere: the plain one would also take Shift+key.
+    if consume(i, shift, Key::F3) {
+        cmds.push(Cmd::Prev);
+    }
+    if consume(i, none, Key::F3) {
+        cmds.push(Cmd::Next);
+    }
+    if consume(i, none, Key::F1) {
+        cmds.push(Cmd::Help);
+    }
+    if i.key_pressed(Key::Escape) {
+        cmds.push(Cmd::Escape);
+    }
+    if typing {
+        return cmds;
+    }
+    if consume(i, none, Key::J) || pressed(i, Key::ArrowDown) {
+        cmds.push(Cmd::Lines(1.0));
+    }
+    if consume(i, none, Key::K) || pressed(i, Key::ArrowUp) {
+        cmds.push(Cmd::Lines(-1.0));
+    }
+    if consume(i, shift, Key::Space) || pressed(i, Key::PageUp) {
+        cmds.push(Cmd::Pages(-1.0));
+    }
+    if consume(i, none, Key::Space) || pressed(i, Key::PageDown) {
+        cmds.push(Cmd::Pages(1.0));
+    }
+    if consume(i, none, Key::D) {
+        cmds.push(Cmd::Pages(0.5));
+    }
+    if consume(i, none, Key::U) {
+        cmds.push(Cmd::Pages(-0.5));
+    }
+    if consume(i, shift, Key::G) || pressed(i, Key::End) {
+        cmds.push(Cmd::Bottom);
+    }
+    if consume(i, none, Key::G) || pressed(i, Key::Home) {
+        cmds.push(Cmd::Top);
+    }
+    if consume(i, none, Key::Slash) {
+        cmds.push(Cmd::Search);
+    }
+    if consume(i, shift, Key::N) {
+        cmds.push(Cmd::Prev);
+    }
+    if consume(i, none, Key::N) {
+        cmds.push(Cmd::Next);
+    }
+    if consume(i, none, Key::O) {
+        cmds.push(Cmd::Outline);
+    }
+    if consume(i, none, Key::F) {
+        cmds.push(Cmd::Files);
+    }
+    if consume(i, none, Key::T) {
+        cmds.push(Cmd::Theme);
+    }
+    if consume(i, none, Key::W) {
+        cmds.push(Cmd::Width);
+    }
+    if consume(i, none, Key::OpenBracket) {
+        cmds.push(Cmd::Narrower);
+    }
+    if consume(i, none, Key::CloseBracket) {
+        cmds.push(Cmd::Wider);
+    }
+    if consume(i, none, Key::Q) {
+        cmds.push(Cmd::Quit);
+    }
+    if consume(i, none, Key::R) {
+        cmds.push(Cmd::Reload);
+    }
+    if consume(i, shift, Key::Questionmark) || consume(i, none, Key::Questionmark) {
+        cmds.push(Cmd::Help);
+    }
+    if consume(i, none, Key::Backspace) {
+        cmds.push(Cmd::Back);
+    }
+    if consume(i, none, Key::Plus) || consume(i, none, Key::Equals) || consume(i, shift, Key::Equals) || consume(i, shift, Key::Plus) {
+        cmds.push(Cmd::ZoomIn);
+    }
+    if consume(i, none, Key::Minus) {
+        cmds.push(Cmd::ZoomOut);
+    }
+    if consume(i, none, Key::Num0) {
+        cmds.push(Cmd::ZoomReset);
+    }
+    cmds
+}
+
+/// The file a dropped folder opens: its README or index, else the first Markdown file
+/// by name. Only this folder is looked at, as the drop is handled on the UI thread.
+#[cfg(windows)]
+fn markdown_in_folder(dir: &Path) -> Option<PathBuf> {
+    if let Some(p) = FOLDER_INDEX.iter().map(|n| dir.join(n)).find(|p| p.is_file()) {
+        return Some(p);
+    }
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| !t.is_dir()) && files::is_markdown(&e.path()))
+        .map(|e| e.path())
+        .min_by_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
 }
 
 /// Rough height guess for blocks that have not been laid out yet.
@@ -1672,17 +1982,135 @@ fn local_path(uri: &str) -> &str {
     uri.strip_prefix("file://").unwrap_or(uri)
 }
 
-fn open_external(target: &str) {
-    let t = target.to_owned();
-    std::thread::Builder::new()
-        .name("open".into())
-        .spawn(move || {
-            if let Err(e) = open::that_detached(&t) {
-                log::warn!("open {t}: {e}");
-            }
-        })
-        .ok();
+/// An image URI as an address worth copying: a plain path for a `file://` image.
+fn image_address(uri: &str) -> String {
+    #[cfg(windows)]
+    if let Some(p) = links::file_uri_to_path(uri) {
+        return links::display_path(&p);
+    }
+    local_path(uri).to_owned()
+}
+
+/// Whether a watcher event is about the open file. On Windows the name can come in the
+/// case the writer used, or as an 8.3 short name (`README~1.MD`).
+fn is_watched_file(p: &Path, target: &Path) -> bool {
+    if p == target {
+        return true;
+    }
+    if !cfg!(windows) || p.parent() != target.parent() {
+        return false;
+    }
+    match (p.file_name(), target.file_name()) {
+        (Some(a), Some(b)) => {
+            let a = a.to_string_lossy().to_lowercase();
+            a == b.to_string_lossy().to_lowercase() || a.contains('~')
+        }
+        _ => false,
+    }
+}
+
+/// Read errors a save in progress causes on Windows: the file is locked (sharing or lock
+/// violation), delete-pending (access denied) or briefly gone while an editor replaces it.
+fn is_transient_read_error(e: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(2 | 5 | 32 | 33))
 }
 
 #[allow(dead_code)]
 fn _unused(_: Color32, _: Stroke) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Ctrl as egui-winit reports it: Cmd on macOS, Ctrl elsewhere.
+    const CTRL: Modifiers = if cfg!(target_os = "macos") {
+        Modifiers { mac_cmd: true, command: true, ..Modifiers::NONE }
+    } else {
+        Modifiers { ctrl: true, command: true, ..Modifiers::NONE }
+    };
+
+    fn keys(presses: &[(Modifiers, Key)], typing: bool) -> Vec<Cmd> {
+        let mut i = egui::InputState::default();
+        i.events = presses
+            .iter()
+            .map(|&(modifiers, key)| egui::Event::Key { key, physical_key: Some(key), pressed: true, repeat: false, modifiers })
+            .collect();
+        key_commands(&mut i, typing)
+    }
+
+    fn key(modifiers: Modifiers, key: Key) -> Vec<Cmd> {
+        keys(&[(modifiers, key)], false)
+    }
+
+    #[test]
+    fn shifted_shortcuts_are_not_taken_by_the_plain_ones() {
+        let shift = Modifiers::SHIFT;
+        let none = Modifiers::NONE;
+        assert_eq!(key(shift, Key::N), [Cmd::Prev]);
+        assert_eq!(key(none, Key::N), [Cmd::Next]);
+        assert_eq!(key(shift, Key::G), [Cmd::Bottom]);
+        assert_eq!(key(none, Key::G), [Cmd::Top]);
+        assert_eq!(key(shift, Key::Space), [Cmd::Pages(-1.0)]);
+        assert_eq!(key(none, Key::Space), [Cmd::Pages(1.0)]);
+        assert_eq!(key(shift, Key::F3), [Cmd::Prev]);
+        assert_eq!(key(none, Key::F3), [Cmd::Next]);
+        // Both in one frame: each goes to its own binding.
+        assert_eq!(keys(&[(shift, Key::N), (none, Key::N)], false), [Cmd::Prev, Cmd::Next]);
+    }
+
+    #[test]
+    fn shift_still_types_symbols() {
+        // '?' and '+' need Shift on a US keyboard, '/' on a German one.
+        assert_eq!(key(Modifiers::SHIFT, Key::Questionmark), [Cmd::Help]);
+        assert_eq!(key(Modifiers::SHIFT, Key::Plus), [Cmd::ZoomIn]);
+        assert_eq!(key(Modifiers::SHIFT, Key::Slash), [Cmd::Search]);
+        assert_eq!(key(Modifiers::NONE, Key::OpenBracket), [Cmd::Narrower]);
+    }
+
+    #[test]
+    fn ctrl_shortcuts_and_typing() {
+        assert_eq!(key(CTRL, Key::O), [Cmd::Open]);
+        assert_eq!(key(CTRL, Key::Q), [Cmd::Quit]);
+        assert_eq!(key(Modifiers::ALT, Key::ArrowLeft), [Cmd::Back]);
+        // Ctrl+N is not a plain N.
+        assert_eq!(key(CTRL, Key::N), []);
+        // A focused text field keeps the single keys but not the Ctrl ones.
+        assert_eq!(keys(&[(Modifiers::NONE, Key::N), (Modifiers::NONE, Key::Q)], true), []);
+        assert_eq!(keys(&[(CTRL, Key::F)], true), [Cmd::Search]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn alt_chords_trigger_nothing_on_windows() {
+        let alt = Modifiers::ALT;
+        let ctrl_alt = CTRL | Modifiers::ALT;
+        for k in [Key::F, Key::O, Key::Q, Key::Space, Key::N, Key::Num0, Key::Backspace, Key::ArrowDown, Key::Home] {
+            assert_eq!(key(alt, k), [], "Alt+{k:?}");
+        }
+        // Ctrl+Alt is AltGr: Ctrl+Alt+Q types '@' on a German keyboard.
+        for k in [Key::Q, Key::W, Key::O, Key::F, Key::R] {
+            assert_eq!(key(ctrl_alt, k), [], "Ctrl+Alt+{k:?}");
+        }
+        assert_eq!(key(Modifiers::ALT, Key::ArrowRight), [Cmd::Forward]);
+        // Ctrl with the navigation keys still scrolls.
+        assert_eq!(key(CTRL, Key::End), [Cmd::Bottom]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dropped_folder_opens_its_readme_or_first_markdown_file() {
+        let dir = std::env::temp_dir().join(format!("mdread-drop-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        assert_eq!(markdown_in_folder(&dir), None);
+        std::fs::write(dir.join("sub").join("a.md"), "").unwrap();
+        std::fs::write(dir.join("notes.txt"), "").unwrap();
+        assert_eq!(markdown_in_folder(&dir), None);
+        std::fs::write(dir.join("Zeta.md"), "").unwrap();
+        std::fs::write(dir.join("beta.markdown"), "").unwrap();
+        assert_eq!(markdown_in_folder(&dir), Some(dir.join("beta.markdown")));
+        std::fs::write(dir.join("index.md"), "").unwrap();
+        assert_eq!(markdown_in_folder(&dir), Some(dir.join("index.md")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
