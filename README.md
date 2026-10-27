@@ -58,13 +58,38 @@ Visual Studio 2022 Build Tools with the "Desktop development with C++" workload
 (MSVC and the Windows SDK, whose `rc.exe` embeds the icon and version info).
 
 ```powershell
-cargo build --release     # target\release\mdread.exe
+cargo build --release                                  # target\release\mdread.exe
+powershell -ExecutionPolicy Bypass -File .\install.ps1 # install for the current user
 ```
 
 `mdread.exe` is a single self-contained file: `.cargo/config.toml` links the C
 runtime statically, so no VC++ redistributable is needed (`cargo install` run
-from outside the checkout does not read that file). Copy it anywhere; there is
-no installer step, and nothing is registered with Windows.
+from outside the checkout does not read that file). `install.ps1` builds,
+copies the exe to `%LOCALAPPDATA%\Programs\mdread`, adds a Start menu shortcut,
+puts the folder on the user `PATH` (open a new terminal afterwards), registers
+App Paths (so Win+R `mdread` works) and registers mdread for `.md .markdown
+.mdown .mkd .mdx` under HKCU; no admin rights needed. Switches: `-NoBuild`
+installs the existing exe, `-NoAssociate` skips the file types, `-NoDefaultApps`
+skips opening Settings, `-Uninstall` removes everything it added. Running
+`install.sh` from Git Bash just points you here.
+
+To build a setup program instead, install [Inno Setup](https://jrsoftware.org/isinfo.php)
+6.3+ or 7 and run `ISCC packaging\windows\mdread.iss` from the repo root after
+`cargo build --release`. That writes `target\installer\mdread-setup-<version>.exe`
+(version from Cargo.toml; override with `/DAppVersion=x.y.z`). The setup installs
+per user without an admin prompt into the same folder and registers the same
+keys as `install.ps1`, with a Start menu shortcut, optional desktop shortcut and
+an "Add to PATH" task (on by default). It closes a running mdread when upgrading.
+Uninstall it from Settings > Apps; `install.ps1 -Uninstall` refuses to touch a
+setup install. Both keep your settings. The builds are unsigned, so SmartScreen
+asks for "More info > Run anyway" when a copied or downloaded setup is run.
+
+Windows does not let a program make itself the default app: the choice is
+stored with a hash that only Settings writes. Both installers therefore list
+mdread in "Open with" and Settings > Default apps, make it the default only for
+extensions no other app has claimed, and finish by opening Settings > Default
+apps on mdread's page (skipped when mdread already opens `.md` files). Pick
+mdread there, or use "Open with > Choose another app > Always" on a `.md` file.
 
 mdread draws with OpenGL and switches to Direct3D 12 by itself when OpenGL is
 not usable, which includes the WARP software renderer in VMs, Remote Desktop
