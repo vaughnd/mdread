@@ -51,7 +51,6 @@ AppId={{697C8DA3-403A-4009-84FF-8E2DD5F4CEF1}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
-AppPublisher=Vaughn Dickson and mdread contributors
 AppPublisherURL=https://github.com/vaughnd/mdread
 AppSupportURL=https://github.com/vaughnd/mdread/issues
 AppCopyright=Copyright (c) 2026 Vaughn Dickson and mdread contributors
@@ -77,6 +76,9 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 #if Ver >= EncodeVer(7, 0, 0)
 SetupArchitecture=x64
+#endif
+; Follows the Windows light/dark setting from 6.6 on.
+#if Ver >= EncodeVer(6, 6, 0)
 WizardStyle=modern dynamic
 #else
 WizardStyle=modern
@@ -159,13 +161,21 @@ const
   ProgId = '{#ProgId}';
   EnvKey = 'Environment';
 
-{ True when no app (per-user or machine-wide) has claimed Ext yet, or it is
-  already ours. HKCR is the merged HKCU-over-HKLM view. }
-function ExtDefaultIsFree(Ext: String): Boolean;
+{ True when RootKey\Software\Classes\Ext names no default app, or names mdread. }
+function ExtDefaultIsFreeIn(RootKey: Integer; Ext: String): Boolean;
 var
   Current: String;
 begin
-  Result := (not RegQueryStringValue(HKCR, Ext, '', Current)) or (Current = '') or (CompareText(Current, ProgId) = 0);
+  Result := (not RegQueryStringValue(RootKey, 'Software\Classes\' + Ext, '', Current)) or (Current = '') or (CompareText(Current, ProgId) = 0);
+end;
+
+{ True when no app, per-user or machine-wide, has claimed Ext yet, or it is
+  already ours. Reads both hives instead of HKCR: once HKCU\Software\Classes\Ext
+  exists (the entry before the check creates it), HKCR no longer shows the
+  HKLM key's values. }
+function ExtDefaultIsFree(Ext: String): Boolean;
+begin
+  Result := ExtDefaultIsFreeIn(HKCU, Ext) and ExtDefaultIsFreeIn(HKLM, Ext);
 end;
 
 { True when .md already opens with mdread: the user's choice in Settings

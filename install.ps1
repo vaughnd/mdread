@@ -62,6 +62,7 @@ $AppPathsKey = "Software\Microsoft\Windows\CurrentVersion\App Paths\$ExeName"
 
 # Always the 64-bit view, like the x64 Inno installer, even from a 32-bit shell.
 $Hkcu = [Microsoft.Win32.RegistryKey]::OpenBaseKey('CurrentUser', 'Registry64')
+$Hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry64')
 $Hkcr = [Microsoft.Win32.RegistryKey]::OpenBaseKey('ClassesRoot', 'Registry64')
 
 if (-not ('MdreadInstall.Native' -as [type])) {
@@ -115,6 +116,12 @@ function Get-RegString($Root, [string]$Path, [string]$Name) {
     $key = $Root.OpenSubKey($Path)
     if (-not $key) { return '' }
     try { return [string]$key.GetValue($Name, '') } finally { $key.Close() }
+}
+
+# True when $Root\Software\Classes\$Ext names no default app, or names mdread.
+function Test-ExtDefaultFree($Root, [string]$Ext) {
+    $current = Get-RegString $Root "Software\Classes\$Ext" ''
+    return ($current -eq '') -or ($current -ieq $ProgId)
 }
 
 # True when .md already opens with mdread: the user's choice in Settings
@@ -177,10 +184,11 @@ function Register-Associations {
         Set-RegValue "Software\Classes\$ext\OpenWithProgids" $ProgId ''
         Set-RegValue "Software\Classes\Applications\$ExeName\SupportedTypes" $ext ''
         Set-RegValue "$CapabilitiesKey\FileAssociations" $ext $ProgId
-        # Claim the extension's default only if no app (per-user or machine-wide;
-        # HKCR is the merged view) has it yet. Windows 11 lets the user choose.
-        $current = Get-RegString $Hkcr $ext ''
-        if ($current -eq '' -or $current -ieq $ProgId) {
+        # Claim the extension's default only if no app, per-user or machine-wide,
+        # has it yet; Windows 11 lets the user choose. Reads both hives instead of
+        # HKCR: once the HKCU key exists (OpenWithProgids above creates it), HKCR
+        # no longer shows the HKLM key's values.
+        if ((Test-ExtDefaultFree $Hkcu $ext) -and (Test-ExtDefaultFree $Hklm $ext)) {
             Set-RegValue "Software\Classes\$ext" '' $ProgId
         }
     }
