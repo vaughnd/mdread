@@ -3,6 +3,12 @@
 # and register it as the default application for Markdown files.
 set -euo pipefail
 cd "$(dirname "$0")"
+# Git Bash / MSYS: this script installs the XDG desktop integration, which Windows lacks.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    echo 'This script installs the XDG desktop integration, which Windows lacks. On Windows see the Windows section of README.md.' >&2
+    exit 1;;
+esac
 # Always build: cargo skips the work when nothing changed, and guarding on the
 # binary's existence would install a stale build after source edits.
 cargo build --release

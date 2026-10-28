@@ -14,7 +14,7 @@ use egui::{
 };
 use pulldown_cmark::Alignment;
 
-use crate::document::{percent_decode, Block, CodeBlock, Footnote, ImageRef, Inline, InlineItem, ListItem, QuoteKind, SpanStyle, Table};
+use crate::document::{Block, CodeBlock, Footnote, ImageRef, Inline, InlineItem, ListItem, QuoteKind, SpanStyle, Table};
 use crate::fonts::FontSet;
 use crate::highlight::Highlighter;
 use crate::search::SearchState;
@@ -98,22 +98,25 @@ impl<'a> RenderCtx<'a> {
 
     fn format(&self, st: &SpanStyle, font_size: f32, color: Color32, lh: f32, hovered: bool, weight: Option<f32>) -> TextFormat {
         let code = st.code || st.math;
+        // A static body font has no weight axis, so headings and table headers (which ask
+        // for 600+) use the bold face instead.
+        let strong = st.bold || (!self.fonts.variable_weight && weight.is_some_and(|w| w >= 600.0));
         let family = if code {
-            self.fonts.mono.clone()
+            self.fonts.inline_mono.clone()
         } else if st.italic {
-            if st.bold {
+            if strong {
                 self.fonts.sans_bold_italic.clone().unwrap_or_else(|| self.fonts.sans_italic.clone())
             } else {
                 self.fonts.sans_italic.clone()
             }
-        } else if st.bold {
+        } else if strong {
             self.fonts.sans_bold.clone().unwrap_or_else(|| self.fonts.sans.clone())
         } else {
             self.fonts.sans.clone()
         };
         let mut size = font_size;
         if code {
-            size *= 0.88;
+            size *= crate::fonts::CODE_SCALE;
         }
         if st.sup || st.sub || st.footnote {
             size *= 0.72;
@@ -128,12 +131,7 @@ impl<'a> RenderCtx<'a> {
             f.color = self.pal.text_dim;
         }
         if !code && self.fonts.variable_weight {
-            let w = match (weight, st.bold) {
-                (Some(w), true) => (w + 150.0).min(800.0),
-                (Some(w), false) => w,
-                (None, true) => 700.0,
-                (None, false) => 400.0,
-            };
+            let w = self.fonts.weight(weight, st.bold);
             if w != 400.0 {
                 f.coords = VariationCoords::new([(b"wght", w)]);
             }
@@ -329,18 +327,28 @@ impl<'a> RenderCtx<'a> {
         if url.is_empty() || url.starts_with("data:") {
             return None;
         }
-        if url.starts_with("http://") || url.starts_with("https://") || url.starts_with("file://") {
+        if url.starts_with("http://") || url.starts_with("https://") {
             return Some(url.to_owned());
         }
-        let path_part = url.split(['#', '?']).next().unwrap_or(url);
-        let path = percent_decode(path_part);
-        let p = Path::new(&path);
-        let abs = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            self.base_dir?.join(p)
-        };
-        Some(format!("file://{}", abs.display()))
+        // Windows paths need their own URI form for egui_extras' file loader, and network
+        // paths are refused.
+        #[cfg(windows)]
+        return crate::links::local_image_uri(url, self.base_dir);
+        #[cfg(not(windows))]
+        {
+            if url.starts_with("file://") {
+                return Some(url.to_owned());
+            }
+            let path_part = url.split(['#', '?']).next().unwrap_or(url);
+            let path = crate::document::percent_decode(path_part);
+            let p = Path::new(&path);
+            let abs = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                self.base_dir?.join(p)
+            };
+            Some(format!("file://{}", abs.display()))
+        }
     }
 
     fn show_image(&mut self, ui: &mut Ui, img: &ImageRef, inline_max_h: Option<f32>) {
@@ -494,17 +502,17 @@ impl<'a> RenderCtx<'a> {
         }
         let ir = self.indented(ui, indent, |s, ui| {
             if let Some(t) = title {
-                let mut rt = RichText::new(t).color(bar_color).size(fs);
-                if !s.fonts.variable_weight {
-                    rt = rt.strong();
-                }
                 let mut job = LayoutJob::default();
-                let mut fmt = TextFormat { font_id: FontId::new(fs, s.fonts.sans.clone()), color: bar_color, line_height: Some(fs * 1.5), ..Default::default() };
+                let family = if s.fonts.variable_weight {
+                    s.fonts.sans.clone()
+                } else {
+                    s.fonts.sans_bold.clone().unwrap_or_else(|| s.fonts.sans.clone())
+                };
+                let mut fmt = TextFormat { font_id: FontId::new(fs, family), color: bar_color, line_height: Some(fs * 1.5), ..Default::default() };
                 if s.fonts.variable_weight {
-                    fmt.coords = VariationCoords::new([(b"wght", 650.0_f32)]);
+                    fmt.coords = VariationCoords::new([(b"wght", s.fonts.weight(Some(650.0), false))]);
                 }
                 job.append(t, 0.0, fmt);
-                let _ = rt;
                 ui.add(Label::new(job).selectable(false));
                 ui.add_space(fs * 0.2);
             }
