@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 # Git Bash / MSYS: this script installs the XDG desktop integration, which Windows lacks.
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
-    echo 'This script installs the XDG desktop integration, which Windows lacks. On Windows see the Windows section of README.md.' >&2
+    echo 'On Windows use install.ps1 (powershell -ExecutionPolicy Bypass -File .\install.ps1) or the setup program built from packaging/windows/mdread.iss.' >&2
     exit 1;;
 esac
 # Always build: cargo skips the work when nothing changed, and guarding on the
