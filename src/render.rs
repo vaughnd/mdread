@@ -102,7 +102,7 @@ impl<'a> RenderCtx<'a> {
         // for 600+) use the bold face instead.
         let strong = st.bold || (!self.fonts.variable_weight && weight.is_some_and(|w| w >= 600.0));
         let family = if code {
-            self.fonts.mono.clone()
+            self.fonts.inline_mono.clone()
         } else if st.italic {
             if strong {
                 self.fonts.sans_bold_italic.clone().unwrap_or_else(|| self.fonts.sans_italic.clone())

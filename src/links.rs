@@ -5,7 +5,7 @@
 //! host. So only web and mail URLs leave the app there, and network paths are only
 //! followed on the share the document itself is on.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::document::percent_decode;
 
@@ -118,7 +118,7 @@ pub fn resolve_local(rel: &str, base: Option<&Path>) -> Result<PathBuf, String> 
         p.to_path_buf()
     } else {
         // `C:x` is relative to the process's current folder on drive C:.
-        if cfg!(windows) && matches!(p.components().next(), Some(std::path::Component::Prefix(_))) {
+        if cfg!(windows) && matches!(p.components().next(), Some(Component::Prefix(_))) {
             return Err(format!("Unsupported path: {rel}"));
         }
         match base {
@@ -126,10 +126,32 @@ pub fn resolve_local(rel: &str, base: Option<&Path>) -> Result<PathBuf, String> 
             None => return Err(format!("No folder to resolve {rel} against")),
         }
     };
+    let abs = normalize(&abs);
     if !network_allowed(&abs, base) {
         return Err(format!("Blocked network path: {}", display_path(&abs)));
     }
     Ok(abs)
+}
+
+/// `p` with `.` and `..` folded away by name, the way links have always resolved: a
+/// `..` goes up from the folder the link names, even one that does not exist or is a
+/// symlink. A `..` at the root stays there, so a link cannot leave a network share.
+fn normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => out.push(c),
+            },
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// The `file://` URI for a local image, or `None` if `url` is not one or is refused.
@@ -185,7 +207,7 @@ pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
 /// that `base`, the document's folder, is on.
 #[cfg(windows)]
 fn network_allowed(p: &Path, base: Option<&Path>) -> bool {
-    use std::path::{Component, Prefix};
+    use std::path::Prefix;
     fn prefix(p: &Path) -> Option<Prefix<'_>> {
         match p.components().next() {
             Some(Component::Prefix(pc)) => Some(pc.kind()),
@@ -272,6 +294,21 @@ mod tests {
     }
 
     #[test]
+    fn dot_segments_fold_away_by_name() {
+        let base = Path::new("/home/u/docs");
+        let local = |url: &str| match classify_link(url, Some(base)) {
+            Some(Target::Local(p, _)) => p,
+            t => panic!("{url}: {t:?}"),
+        };
+        assert_eq!(local("../b.md"), Path::new("/home/u/b.md"));
+        assert_eq!(local("./b.md"), Path::new("/home/u/docs/b.md"));
+        // `drafts` need not exist, and is not followed if it is a symlink.
+        assert_eq!(local("drafts/../b.md"), Path::new("/home/u/docs/b.md"));
+        assert_eq!(local("../../../../x.md"), Path::new("/x.md"));
+        assert_eq!(normalize(Path::new("../../a/../b")), Path::new("../../b"));
+    }
+
+    #[test]
     fn web_links_leave_the_app() {
         let t = classify_link("https://example.org/a#b", None);
         assert_eq!(t, Some(Target::External("https://example.org/a#b".into())));
@@ -309,11 +346,30 @@ mod tests {
                 assert!(matches!(classify_link(url, Some(base())), Some(Target::Blocked(_))), "{url}");
             }
             let share = Path::new(r"\\Server\Docs\guide");
-            assert_eq!(classify_link("../b.md", Some(share)), Some(Target::Local(share.join("../b.md"), None)));
+            assert_eq!(classify_link("../b.md", Some(share)), Some(Target::Local(PathBuf::from(r"\\Server\Docs\b.md"), None)));
+            // `..` stops at the share's root.
+            let up = classify_link("../../../x/b.md", Some(share));
+            assert_eq!(up, Some(Target::Local(PathBuf::from(r"\\Server\Docs\x\b.md"), None)));
             assert!(matches!(classify_link(r"\\server\docs\b.md", Some(share)), Some(Target::Local(..))));
             assert!(matches!(classify_link(r"\\server\other\b.md", Some(share)), Some(Target::Blocked(_))));
             let verbatim = Path::new(r"\\?\UNC\server\docs\guide");
             assert!(matches!(classify_link("b.md", Some(verbatim)), Some(Target::Local(..))));
+        }
+
+        #[test]
+        fn relative_links_resolve_against_long_verbatim_folders() {
+            // dunce keeps `\\?\` on paths too long to lose it, and Windows takes `/` and
+            // `..` literally after that prefix, so joining must fold them.
+            let long = Path::new(r"\\?\C:\docs\guide");
+            let local = |url: &str| match classify_link(url, Some(long)) {
+                Some(Target::Local(p, _)) => p.into_os_string().into_string().unwrap(),
+                t => panic!("{url}: {t:?}"),
+            };
+            assert_eq!(local("img/x.png"), r"\\?\C:\docs\guide\img\x.png");
+            assert_eq!(local("../b.md"), r"\\?\C:\docs\b.md");
+            assert_eq!(local("./a/./b.md"), r"\\?\C:\docs\guide\a\b.md");
+            let uri = local_image_uri("img/x.png", Some(long));
+            assert_eq!(uri.as_deref(), Some(r"file:///\\?\C:\docs\guide\img\x.png"));
         }
 
         #[test]
@@ -324,8 +380,8 @@ mod tests {
                 let same = back == Path::new(p) || (p.starts_with(r"\\?\UNC\") && back == Path::new(r"\\server\share\x.png"));
                 assert!(same, "{p} -> {uri} -> {back:?}");
             }
-            assert_eq!(local_image_uri("img/a%20b.png?raw=1", Some(base())).as_deref(), Some(r"file:///C:\docs\img/a b.png"));
-            assert_eq!(local_image_uri("file:///D:/pics/x.png", Some(base())).as_deref(), Some("file:///D:/pics/x.png"));
+            assert_eq!(local_image_uri("img/a%20b.png?raw=1", Some(base())).as_deref(), Some(r"file:///C:\docs\img\a b.png"));
+            assert_eq!(local_image_uri("file:///D:/pics/x.png", Some(base())).as_deref(), Some(r"file:///D:\pics\x.png"));
             assert_eq!(local_image_uri("//evil/share/x.png", Some(base())), None);
             assert_eq!(local_image_uri("file://evil/share/x.png", Some(base())), None);
             assert_eq!(local_image_uri("img/x.png", None), None);

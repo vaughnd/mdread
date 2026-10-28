@@ -29,6 +29,9 @@ pub struct FontSet {
     pub sans_bold_italic: Option<FontFamily>,
     /// Code face (also installed as `FontFamily::Monospace`).
     pub mono: FontFamily,
+    /// Code face for inline code, shifted onto the body text's baseline where needed;
+    /// otherwise `mono`.
+    pub inline_mono: FontFamily,
     /// True when `sans` is a variable font with a `wght` axis, so bold is done with coords.
     pub variable_weight: bool,
     /// Range of the body font's `wght` axis (only meaningful with `variable_weight`).
@@ -188,13 +191,6 @@ const SANS: &[Candidate] = &[
     },
 ];
 
-/// (bold, bold italic) faces used when the body font is static and has no bold of its
-/// own (e.g. an MDREAD_FONT override), because egui cannot synthesise bold.
-#[cfg(windows)]
-const BOLD_FALLBACK: &[(&str, &str)] = &[("segoeuib.ttf", "segoeuiz.ttf"), ("arialbd.ttf", "arialbi.ttf")];
-#[cfg(not(windows))]
-const BOLD_FALLBACK: &[(&str, &str)] = &[];
-
 #[cfg(not(windows))]
 const MONO: &[(&str, &str)] = &[("JetBrains Mono", "JetBrainsMono-Regular.ttf")];
 #[cfg(windows)]
@@ -320,7 +316,8 @@ fn wght_axis(data: &FontData) -> Option<(f32, f32)> {
     data.variation_axes()
         .into_iter()
         .find(|a| a.tag == wght)
-        .map(|a| (a.range.min, a.range.max))
+        // In order even if a broken font has them the wrong way round: `clamp` panics.
+        .map(|a| (a.range.min.min(a.range.max), a.range.min.max(a.range.max)))
 }
 
 /// A face's ascent as a fraction of its em, chosen the way skrifa (and so epaint) does:
@@ -474,13 +471,10 @@ pub fn install(ctx: &Context) -> FontSet {
         } else {
             sans_italic = FontFamily::Proportional;
         }
+        // A static font without a bold of its own (an MDREAD_FONT override) stays regular:
+        // egui cannot synthesise bold, and another typeface's bold would switch every
+        // heading and bold word to that typeface.
         if !variable {
-            if bold.is_none() {
-                if let Some((b, bi)) = BOLD_FALLBACK.iter().find_map(|(b, bi)| Some((read(b)?, read(bi)))) {
-                    bold = Some(b);
-                    bold_italic = bi;
-                }
-            }
             if let Some(bytes) = bold {
                 defs.font_data
                     .insert("mdread-sans-bold".to_owned(), Arc::new(FontData::from_owned(bytes)));
@@ -538,21 +532,32 @@ pub fn install(ctx: &Context) -> FontSet {
             }
         }
     }
+    #[allow(unused_mut)]
+    let mut inline_mono = FontFamily::Monospace;
     if let Some(bytes) = mono_bytes {
-        #[allow(unused_mut)]
-        let mut data = FontData::from_owned(bytes);
-        // Segoe UI Variable's ascent is much taller than any code font's.
+        // Segoe UI Variable's ascent is much taller than any code font's. Only inline code
+        // sits on the body text's baseline, so it gets a shifted copy of the face; code
+        // blocks and the rest of the monospace text keep the plain one.
         #[cfg(windows)]
-        if let Some(shift) = sans_ascent.zip(ascent_em(&data.font)).and_then(|(s, m)| code_baseline_shift(s, m)) {
-            log::debug!("fonts: shifting code glyphs down by {shift:.3} em to the body baseline");
+        if let Some(shift) = sans_ascent.zip(ascent_em(&bytes)).and_then(|(s, m)| code_baseline_shift(s, m)) {
+            log::debug!("fonts: shifting inline code down by {shift:.3} em to the body baseline");
+            let mut data = FontData::from_owned(bytes.clone());
             data.tweak.y_offset_factor = shift;
+            defs.font_data.insert("mdread-mono-inline".to_owned(), Arc::new(data));
+            let mut list = vec!["mdread-mono-inline".to_owned()];
+            list.extend(defs.families.get(&FontFamily::Monospace).into_iter().flatten().cloned());
+            inline_mono = family(&mut defs, "mdread-mono-inline", list);
         }
-        defs.font_data.insert("mdread-mono".to_owned(), Arc::new(data));
+        defs.font_data.insert("mdread-mono".to_owned(), Arc::new(FontData::from_owned(bytes)));
         let mono = defs.families.entry(FontFamily::Monospace).or_default();
         mono.insert(0, "mdread-mono".to_owned());
     }
 
     log::debug!("fonts: body {sans_name} (variable weight: {variable}, wght {wght_range:?}), code {mono_name}");
+    #[cfg(windows)]
+    if let Ok(mut fb) = FALLBACKS.lock() {
+        fb.defs = Some(defs.clone());
+    }
     ctx.set_fonts(defs);
 
     FontSet {
@@ -561,6 +566,7 @@ pub fn install(ctx: &Context) -> FontSet {
         sans_bold,
         sans_bold_italic,
         mono: FontFamily::Monospace,
+        inline_mono,
         variable_weight: variable,
         wght_range,
         sans_name,
@@ -608,44 +614,79 @@ fn scripts(text: &str) -> Scripts {
 }
 
 /// Windows always has CJK fonts, but they are .ttc collections of 13-20 MB each, so they
-/// are only read the first time a document needs them and appended (lowest priority)
-/// to every body and code family. Japanese text (any kana) gets Yu Gothic UI, which also
-/// covers its kanji; other Han text gets Microsoft YaHei UI; Hangul gets Malgun Gothic.
+/// are only read the first time a document or the UI needs them, and appended (lowest
+/// priority) to every body and code family in this order, whatever order they were
+/// loaded in. Japanese text (any kana) gets Yu Gothic UI, which also covers its kanji;
+/// other Han text gets Microsoft YaHei UI, after Yu Gothic, so kanji keep their Japanese
+/// forms even when a Chinese document was opened first; Hangul gets Malgun Gothic.
 /// Weight coords do not apply to these static faces, so CJK bold renders regular.
 /// Segoe UI Symbol likewise covers the arrows, check marks and other symbols that
 /// would otherwise be boxes; it comes after egui's emoji fonts, so whatever those
 /// already draw looks the same.
 #[cfg(windows)]
-pub fn add_script_fallbacks(ctx: &Context, fonts: &FontSet, text: &str) {
-    use std::sync::Mutex;
+const SCRIPT_FACES: [(&str, u32, &str); 4] = [
+    ("YuGothM.ttc", 1, "mdread-cjk-ja"),
+    ("msyh.ttc", 1, "mdread-cjk-zh"),
+    ("malgun.ttf", 0, "mdread-cjk-ko"),
+    ("seguisym.ttf", 0, "mdread-symbols"),
+];
 
-    static LOADED: Mutex<Scripts> = Mutex::new(Scripts { han: false, kana: false, hangul: false, symbols: false });
+/// The fonts as `install` set them plus the script faces read so far, and the scripts
+/// whose face has been looked for.
+#[cfg(windows)]
+struct Fallbacks {
+    defs: Option<FontDefinitions>,
+    loaded: Scripts,
+}
+
+#[cfg(windows)]
+static FALLBACKS: std::sync::Mutex<Fallbacks> =
+    std::sync::Mutex::new(Fallbacks { defs: None, loaded: Scripts { han: false, kana: false, hangul: false, symbols: false } });
+
+/// Reads the [`SCRIPT_FACES`] that `text` needs and has not needed before.
+#[cfg(windows)]
+pub fn add_script_fallbacks(ctx: &Context, fonts: &FontSet, text: &str) {
+    let Ok(mut fb) = FALLBACKS.lock() else { return };
+    let mut loaded = fb.loaded;
+    if loaded.han && loaded.kana && loaded.hangul && loaded.symbols {
+        return;
+    }
     let need = scripts(text);
-    let Ok(mut loaded) = LOADED.lock() else { return };
-    // (file, face index, name), in the order they should be tried.
-    let mut faces: Vec<(&str, u32, &str)> = Vec::new();
+    let mut new = [false; SCRIPT_FACES.len()];
     if need.kana && !loaded.kana {
         loaded.kana = true;
         loaded.han = true;
-        faces.push(("YuGothM.ttc", 1, "mdread-cjk-ja"));
+        new[0] = true;
     }
     if need.han && !loaded.han {
         loaded.han = true;
-        faces.push(("msyh.ttc", 1, "mdread-cjk-zh"));
+        new[1] = true;
     }
     if need.hangul && !loaded.hangul {
         loaded.hangul = true;
-        faces.push(("malgun.ttf", 0, "mdread-cjk-ko"));
+        new[2] = true;
     }
     if need.symbols && !loaded.symbols {
         loaded.symbols = true;
-        faces.push(("seguisym.ttf", 0, "mdread-symbols"));
+        new[3] = true;
     }
-    if faces.is_empty() {
+    fb.loaded = loaded;
+    let Some(defs) = fb.defs.as_mut() else { return };
+    let mut added = false;
+    for ((file, index, name), _) in SCRIPT_FACES.into_iter().zip(new).filter(|&(_, new)| new) {
+        let Some(bytes) = read(file) else {
+            log::debug!("fonts: {file} not found");
+            continue;
+        };
+        log::debug!("fonts: adding {file} #{index} as a fallback");
+        defs.font_data.insert(name.to_owned(), Arc::new(FontData { index, ..FontData::from_owned(bytes) }));
+        added = true;
+    }
+    if !added {
         return;
     }
     let mut families = vec![FontFamily::Proportional, FontFamily::Monospace];
-    for f in [Some(&fonts.sans_italic), fonts.sans_bold.as_ref(), fonts.sans_bold_italic.as_ref()]
+    for f in [Some(&fonts.sans_italic), Some(&fonts.inline_mono), fonts.sans_bold.as_ref(), fonts.sans_bold_italic.as_ref()]
         .into_iter()
         .flatten()
     {
@@ -653,22 +694,15 @@ pub fn add_script_fallbacks(ctx: &Context, fonts: &FontSet, text: &str) {
             families.push(f.clone());
         }
     }
-    for (file, index, name) in faces {
-        let Some(bytes) = read(file) else {
-            log::debug!("fonts: {file} not found");
-            continue;
-        };
-        log::debug!("fonts: adding {file} #{index} as a fallback");
-        let data = FontData { index, ..FontData::from_owned(bytes) };
-        let families = families
-            .iter()
-            .map(|f| egui::epaint::text::InsertFontFamily {
-                family: f.clone(),
-                priority: egui::epaint::text::FontPriority::Lowest,
-            })
-            .collect();
-        ctx.add_font(egui::epaint::text::FontInsert::new(name, data, families));
+    let faces: Vec<String> =
+        SCRIPT_FACES.iter().map(|&(_, _, name)| name.to_owned()).filter(|name| defs.font_data.contains_key(name)).collect();
+    for f in families {
+        let list = defs.families.entry(f).or_default();
+        list.retain(|name| !faces.contains(name));
+        list.extend(faces.iter().cloned());
     }
+    ctx.set_fonts(defs.clone());
+    ctx.request_repaint();
 }
 
 #[cfg(not(windows))]

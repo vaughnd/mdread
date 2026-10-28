@@ -35,10 +35,11 @@ fn decode_with(bytes: Vec<u8>, legacy: &'static Encoding) -> Decoded {
 
 /// Invalid UTF-8 that is still UTF-8 for all practical purposes: a multi-byte character
 /// cut off at the end (a file read while it is being written), or a few stray bytes (say
-/// one character pasted from a cp1252 source) among more valid multi-byte characters.
-/// Decoding those as the legacy code page would garble every correct character. Text in
-/// a legacy encoding, Shift_JIS and GBK included, only forms a valid multi-byte UTF-8
-/// sequence now and then. A single trailing lead byte after plain ASCII is ambiguous
+/// one character pasted from a cp1252 source) among at least as many valid multi-byte
+/// characters. Decoding those as the legacy code page would garble every correct
+/// character, where UTF-8 loses only the stray bytes. Text in a legacy encoding,
+/// Shift_JIS and GBK included, only forms a valid multi-byte UTF-8 sequence now and
+/// then. A single trailing lead byte after plain ASCII is ambiguous
 /// (`é` in cp1252 ends many words), so it only counts as cut off after other UTF-8.
 fn mostly_utf8(bytes: &[u8]) -> bool {
     let (mut valid, mut invalid) = (0usize, 0usize);
@@ -51,7 +52,7 @@ fn mostly_utf8(bytes: &[u8]) -> bool {
             invalid += 1;
         }
     }
-    invalid == 0 || valid > invalid
+    valid >= invalid
 }
 
 /// CRLF and lone CR become LF: pulldown-cmark keeps the CR in code spans (as an extra
@@ -146,6 +147,9 @@ mod tests {
     fn stray_bytes_in_utf8_text_cost_one_character() {
         let bytes = ["café 日本 ".as_bytes(), b"\xA0", b" x"].concat();
         assert_eq!(dec(&bytes), ("café 日本 \u{FFFD} x".into(), None));
+        // As many stray bytes as real characters is still UTF-8.
+        let bytes = ["a — b ".as_bytes(), b"\x93", b"c"].concat();
+        assert_eq!(dec(&bytes), ("a — b \u{FFFD}c".into(), None));
     }
 
     #[test]

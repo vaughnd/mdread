@@ -50,20 +50,26 @@ fn wide(s: &OsStr) -> Vec<u16> {
 /// Makes stdout/stderr usable for CLI output. A GUI-subsystem exe started from a terminal
 /// gets no standard handles unless they are redirected, so attach to the parent's
 /// console. Only done right before printing and exiting: a process attached to a console
-/// is killed by Ctrl+C and by closing that console. Returns false when there is nowhere
-/// to write to (started from Explorer or a shortcut).
-pub fn attach_console() -> bool {
+/// is killed by Ctrl+C and by closing that console. Returns whether stderr (`err`) or
+/// stdout can be written to; false when there is nowhere to write to (started from
+/// Explorer or a shortcut).
+pub fn attach_console(err: bool) -> bool {
     let usable = |h: HANDLE| !h.is_null() && h != INVALID_HANDLE_VALUE;
+    let ids = [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+    let want = if err { STD_ERROR_HANDLE } else { STD_OUTPUT_HANDLE };
     unsafe {
-        if usable(GetStdHandle(STD_OUTPUT_HANDLE)) || usable(GetStdHandle(STD_ERROR_HANDLE)) {
-            return true;
+        let before = ids.map(|id| GetStdHandle(id));
+        // With one stream redirected (`mdread --help > out.txt`), the other still needs
+        // the console.
+        if before.into_iter().all(usable) || AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return usable(GetStdHandle(want));
         }
-        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
-            return false;
-        }
-        // Rust looks the handles up on every write; fill in any that attaching left empty.
-        for id in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
-            if !usable(GetStdHandle(id)) {
+        // Rust looks the handles up on every write; keep the redirected ones and fill in
+        // any that attaching left empty.
+        for (id, h) in ids.into_iter().zip(before) {
+            if usable(h) {
+                SetStdHandle(id, h);
+            } else if !usable(GetStdHandle(id)) {
                 let h = CreateFileW(
                     wide(OsStr::new("CONOUT$")).as_ptr(),
                     GENERIC_READ | GENERIC_WRITE,
@@ -78,8 +84,8 @@ pub fn attach_console() -> bool {
                 }
             }
         }
+        usable(GetStdHandle(want))
     }
-    true
 }
 
 /// Shows a message box. Runs on its own thread so the box's modal loop does not dispatch

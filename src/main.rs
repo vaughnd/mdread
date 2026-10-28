@@ -42,20 +42,24 @@ ENVIRONMENT:
     MDREAD_MONO_FONT     Path to a .ttf/.otf to use for code
 ";
 
-/// Makes stdout/stderr reach the terminal before printing. Release builds on Windows
-/// have no console of their own; returns false if there is none to borrow either.
-pub fn cli_console() -> bool {
+/// Makes stdout/stderr reach the terminal before printing to stderr (`err`) or stdout.
+/// Release builds on Windows have no console of their own; returns false if that stream
+/// has nowhere to go.
+pub fn cli_console(err: bool) -> bool {
     #[cfg(windows)]
-    return win::attach_console();
+    return win::attach_console(err);
     #[cfg(not(windows))]
-    true
+    {
+        let _ = err;
+        true
+    }
 }
 
 /// Prints CLI output (help, version, usage errors) and exits. On Windows, without a
 /// terminal to print to, the text is shown in a message box instead.
 fn exit_with(text: &str, code: i32) -> ! {
     use std::io::Write;
-    if cli_console() {
+    if cli_console(code != 0) {
         // Not print!: it panics when the reader has gone away (`mdread --help | head -1`).
         let mut out: Box<dyn Write> = if code == 0 { Box::new(std::io::stdout()) } else { Box::new(std::io::stderr()) };
         let _ = out.write_all(text.as_bytes()).and_then(|_| out.flush());

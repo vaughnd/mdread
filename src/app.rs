@@ -364,6 +364,9 @@ impl App {
     fn set_document(&mut self, text: String, path: Option<PathBuf>, ctx: &Context) {
         let t0 = Instant::now();
         fonts::add_script_fallbacks(ctx, &self.fonts, &text);
+        if let Some(p) = &path {
+            fonts::add_script_fallbacks(ctx, &self.fonts, &p.to_string_lossy());
+        }
         let doc = Document::parse(&text);
         log::debug!("parsed {} bytes into {} blocks in {:.2} ms", text.len(), doc.blocks.len(), t0.elapsed().as_secs_f64() * 1000.0);
         self.gen += 1;
@@ -396,7 +399,6 @@ impl App {
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let decoded = text::decode(bytes);
-                *self.seen.lock() = stamp;
                 if push_history {
                     if let Some(cur) = self.history.get_mut(self.history_pos) {
                         cur.1 = self.scroll_offset;
@@ -415,7 +417,7 @@ impl App {
                 self.pending_offset = Some(0.0);
                 self.jump = None;
                 self.reload_retries = 0;
-                self.setup_watcher(&path, ctx);
+                self.setup_watcher(&path, stamp, ctx);
                 let dir = path.parent().map(Path::to_path_buf);
                 if dir != self.files_dir {
                     self.files_dir = dir.clone();
@@ -466,10 +468,14 @@ impl App {
         }
     }
 
-    fn setup_watcher(&mut self, path: &Path, ctx: &Context) {
+    /// Watches `path`, last read when it had `stamp`.
+    fn setup_watcher(&mut self, path: &Path, stamp: Option<FileStamp>, ctx: &Context) {
         self.watcher = None;
         self.watch_rx = None;
         self.watch_alive.store(false, Ordering::Relaxed);
+        // A new cell per watcher: the stopped poller may be past its `alive` check and
+        // about to store the old file's stamp.
+        self.seen = Arc::new(egui::mutex::Mutex::new(stamp));
         let Some(dir) = path.parent() else { return };
         let (tx, rx) = mpsc::channel();
         self.watch_rx = Some(rx);
@@ -612,6 +618,16 @@ impl App {
 
     fn set_status(&mut self, s: impl Into<String>) {
         self.status = Some((s.into(), Instant::now()));
+    }
+
+    /// Fonts for East Asian scripts and symbols in the UI's own short texts (messages and
+    /// the search box), which can need them before any document does.
+    fn add_ui_script_fallbacks(&self, ctx: &Context) {
+        let status = self.status.as_ref().map(|(s, _)| s.as_str());
+        let query = self.search.open.then_some(self.search.query.as_str());
+        for text in [status, self.error.as_deref(), query].into_iter().flatten() {
+            fonts::add_script_fallbacks(ctx, &self.fonts, text);
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1061,7 +1077,8 @@ impl App {
             if missed {
                 if let Some(path) = self.path.clone() {
                     log::debug!("{} changed without a watcher event; watching again", path.display());
-                    self.setup_watcher(&path, ctx);
+                    let stamp = *self.seen.lock();
+                    self.setup_watcher(&path, stamp, ctx);
                 }
             }
             if changed || missed {
@@ -1097,6 +1114,9 @@ impl App {
         if let Some(rx) = &self.files_rx {
             match rx.try_recv() {
                 Ok(files) => {
+                    for f in &files {
+                        fonts::add_script_fallbacks(ctx, &self.fonts, &f.to_string_lossy());
+                    }
                     self.files = files;
                     self.files_rx = None;
                 }
@@ -1638,7 +1658,7 @@ impl App {
         });
         if let Some(img) = shot {
             let [w, h] = img.size;
-            crate::cli_console();
+            crate::cli_console(true);
             match image::save_buffer(&path, img.as_raw(), w as u32, h as u32, image::ColorType::Rgba8) {
                 Ok(()) => eprintln!("screenshot saved to {} ({w}x{h})", path.display()),
                 Err(e) => eprintln!("screenshot failed: {e}"),
@@ -1685,6 +1705,7 @@ impl eframe::App for App {
         let frame_t0 = Instant::now();
         self.poll_channels(&ctx);
         self.handle_input(&ctx, frame);
+        self.add_ui_script_fallbacks(&ctx);
         #[cfg(windows)]
         self.sync_title_bar(frame);
         self.handle_screenshot(&ctx);
@@ -1992,7 +2013,8 @@ fn image_address(uri: &str) -> String {
 }
 
 /// Whether a watcher event is about the open file. On Windows the name can come in the
-/// case the writer used, or as an 8.3 short name (`README~1.MD`).
+/// case the writer used, or as an 8.3 short name (`README~1.MD`), which only counts if
+/// it still leads to the open file.
 fn is_watched_file(p: &Path, target: &Path) -> bool {
     if p == target {
         return true;
@@ -2000,13 +2022,20 @@ fn is_watched_file(p: &Path, target: &Path) -> bool {
     if !cfg!(windows) || p.parent() != target.parent() {
         return false;
     }
-    match (p.file_name(), target.file_name()) {
-        (Some(a), Some(b)) => {
-            let a = a.to_string_lossy().to_lowercase();
-            a == b.to_string_lossy().to_lowercase() || a.contains('~')
-        }
-        _ => false,
+    let lower = |p: &Path| p.as_os_str().to_string_lossy().to_lowercase();
+    match p.file_name().map(|n| n.to_string_lossy()) {
+        Some(name) if is_short_name(&name) => dunce::canonicalize(p).is_ok_and(|long| lower(&long) == lower(target)),
+        Some(_) => lower(p) == lower(target),
+        None => false,
     }
+}
+
+/// An 8.3 short name: up to eight characters ending in `~` and digits, then an optional
+/// extension of up to three (`README~1.MD`). Not `notes.md~`, `~$x.docx` or `.~lock.x#`.
+fn is_short_name(name: &str) -> bool {
+    let (stem, ext) = name.split_once('.').unwrap_or((name, ""));
+    let Some((head, num)) = stem.rsplit_once('~') else { return false };
+    !head.is_empty() && stem.len() <= 8 && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) && ext.len() <= 3 && !ext.contains('.')
 }
 
 /// Read errors a save in progress causes on Windows: the file is locked (sharing or lock
@@ -2111,6 +2140,34 @@ mod tests {
         assert_eq!(markdown_in_folder(&dir), Some(dir.join("beta.markdown")));
         std::fs::write(dir.join("index.md"), "").unwrap();
         assert_eq!(markdown_in_folder(&dir), Some(dir.join("index.md")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn short_names_are_told_from_editor_temp_files() {
+        for name in ["README~1.MD", "NOTES~12.M", "AB~1", "PROGRA~1"] {
+            assert!(is_short_name(name), "{name}");
+        }
+        for name in ["notes.md~", "~$report.docx", ".~lock.x#", "README~1.MARKDOWN", "LONGNAME~1.MD", "a~b.md", "x~1.tar.gz"] {
+            assert!(!is_short_name(name), "{name}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn only_the_open_file_counts_as_watched() {
+        let dir = dunce::canonicalize(std::env::temp_dir()).unwrap().join(format!("mdread-watch-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("notes.md");
+        for name in ["notes.md", "other.md", "notes.md~", "~$notes.md"] {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+        assert!(is_watched_file(&target, &target));
+        assert!(is_watched_file(&dir.join("NOTES.MD"), &target));
+        for name in ["other.md", "notes.md~", "~$notes.md", "NOTES~9.MD"] {
+            assert!(!is_watched_file(&dir.join(name), &target), "{name}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
