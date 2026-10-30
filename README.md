@@ -21,6 +21,10 @@ code with syntect.
   images (PNG, JPEG, GIF, WebP, SVG), inline badges, HTML `<img>`.
 - Links: web links open in the browser, relative `.md` links open in the
   viewer (with back/forward), `#anchors` jump within the document.
+- Mermaid diagrams (```` ```mermaid ```` blocks) drawn natively, without a
+  browser: flowcharts, sequence, class, state, ER, gantt, pie and the other
+  Mermaid types, in Mermaid's dark theme on the dark page. A diagram wider than
+  the column spreads into the margins beside it.
 - Search with highlighted matches, copy button on code blocks, text selection,
   right-click menu to copy the selection or open and copy links.
 
@@ -32,8 +36,9 @@ cargo build --release          # binary at target/release/mdread
                                # icons, and makes mdread the default for Markdown files
 ```
 
-Requires rustc 1.92+ (Ubuntu 26.04 ships 1.93 and cargo via `apt install cargo`).
-No system GUI libraries are needed beyond Mesa/Wayland/X11 runtime libraries.
+Requires rustc 1.95+. Ubuntu 26.04's own Rust packages stop at 1.93, so install
+the toolchain with rustup: `sudo apt install rustup && rustup default stable`
+(this replaces the `cargo` and `rustc` packages). No system GUI libraries are needed beyond Mesa/Wayland/X11 runtime libraries.
 No packaging (.deb) is needed: a per-user desktop entry is enough for GNOME,
 Nautilus and `xdg-open`. The installer writes the binary's absolute path into
 the entry because GNOME launches apps with a `PATH` that does not include
@@ -189,6 +194,13 @@ $env:MDREAD_MONO_FONT = 'consola.ttf'
 
 egui renders text with greyscale antialiasing (no ClearType) and monochrome
 emoji, and lays out Arabic and Hebrew left to right without shaping.
+
+Diagram labels use Trebuchet MS, Mermaid's default font. Windows and macOS have
+it; on Linux it comes with the Microsoft core fonts (`ttf-mscorefonts-installer`),
+and without it diagrams use Arial, Liberation Sans, Helvetica, Noto Sans or
+DejaVu Sans. Boxes are sized to the labels as that font draws them. Characters
+those fonts lack are taken from any installed font that has them. The installed
+fonts are scanned the first time a document has a diagram.
 
 ## Debugging
 

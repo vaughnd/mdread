@@ -7,3 +7,8 @@ rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.aarch64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Resolve to dependency versions that build with the package's rust-version, so that
+# `cargo update` does not pick releases that need a newer rustc than the README asks for.
+[resolver]
+incompatible-rust-versions = "fallback"

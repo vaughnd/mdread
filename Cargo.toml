@@ -2,15 +2,17 @@
 name = "mdread"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.92"
+rust-version = "1.95"
 description = "A very fast GPU-rendered Markdown viewer for large, high-DPI screens"
 license = "MIT"
 repository = "https://github.com/vaughnd/mdread"
 homepage = "https://github.com/vaughnd/mdread"
 
 [dependencies]
-egui = { version = "0.35", features = ["serde"] }
-egui_extras = { version = "0.35", default-features = false, features = ["all_loaders"] }
+# The emoji fonts egui bundles, which also have the arrows, check marks and other symbols
+# that body fonts often lack.
+egui = { version = "0.37", features = ["serde", "monochrome_emoji_fonts"] }
+egui_extras = { version = "0.37", default-features = false, features = ["all_loaders"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["simd"] }
 syntect = { version = "5", default-features = false, features = ["parsing", "dump-load", "regex-fancy", "default-themes"] }
@@ -23,12 +25,23 @@ dunce = "1"
 # Text files that are not UTF-8: BOM-tagged UTF-16, or the legacy ANSI code page.
 encoding_rs = "0.8"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Mermaid diagrams, laid out as SVG without a browser. Without the ELK layouts (EPL-2.0;
+# diagrams that ask for one get the default layout) and math labels (bundled KaTeX fonts).
+merman = { version = "0.9.3", default-features = false, features = ["all-diagrams", "layout-cytoscape"] }
+# Same version as egui_extras uses. Draws the diagrams, and on Windows backs the SVG loader
+# that restricts <image href>.
+resvg = { version = "0.45.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+# The version resvg uses; to find a font for a character that diagram fonts lack.
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+# The shaper usvg uses, to tell merman how wide diagram labels will be drawn.
+rustybuzz = "0.20.1"
 env_logger = { version = "0.11", default-features = false }
 log = "0.4"
 
 [target.'cfg(not(windows))'.dependencies]
-egui_extras = { version = "0.35", default-features = false, features = ["all_loaders", "svg_text"] }
-eframe = { version = "0.35", default-features = false, features = ["glow", "wayland", "x11", "persistence", "default_fonts"] }
+egui_extras = { version = "0.37", default-features = false, features = ["all_loaders", "svg_text"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "wayland", "x11", "clipboard", "persistence", "default_fonts"] }
 
 # Windows starts with glow and falls back to wgpu (DX12, or the WARP software adapter in
 # VMs and RDP sessions) when no usable OpenGL driver is present. Only the DX12 backend of
@@ -36,13 +49,11 @@ eframe = { version = "0.35", default-features = false, features = ["glow", "wayl
 [target.'cfg(windows)'.dependencies]
 # No "svg_text" here: it makes the SVG loader scan every system font at startup, which is
 # slow on Windows. The cost is that text inside SVGs (badge labels) is not drawn.
-eframe = { version = "0.35", default-features = false, features = ["glow", "wgpu_no_default_features", "persistence", "default_fonts"] }
-wgpu = { version = "29", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "wgpu_no_default_features", "clipboard", "persistence", "default_fonts"] }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "wgsl"] }
 rfd = { version = "0.17", default-features = false }
 # The window handle eframe gives out, for the dialog owner and the title bar colour.
 raw-window-handle = "0.6"
-# Same version as egui_extras uses; for the SVG loader that restricts <image href>.
-resvg = { version = "0.45.1", default-features = false }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Globalization",

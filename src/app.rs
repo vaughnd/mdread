@@ -25,6 +25,7 @@ use crate::files;
 use crate::fonts::{self, FontSet};
 use crate::highlight::{self, Highlighter};
 use crate::links::{self, Target};
+use crate::mermaid::Diagrams;
 use crate::render::{Action, RenderCtx};
 use crate::search::SearchState;
 use crate::text;
@@ -155,10 +156,13 @@ pub struct App {
     pending_offset: Option<f32>,
     scroll_delta: f32,
     jump: Option<(usize, u8)>,
+    /// Until when a jump waits for diagrams above its target to be laid out.
+    jump_until: Instant,
     pending_anchor: Option<String>,
 
     search: SearchState,
     hl: Highlighter,
+    diagrams: Diagrams,
     hovered_link: Option<(usize, u32)>,
 
     /// Reading-column viewport from the last frame, in points.
@@ -200,7 +204,8 @@ pub struct App {
     saved_theme: ThemeChoice,
     screenshot: Option<PathBuf>,
     screenshot_delay_ms: u64,
-    screenshot_requested: bool,
+    /// Where the screenshot lands once requested and taken.
+    screenshot_taken: Option<Arc<egui::mutex::Mutex<Option<Arc<egui::ColorImage>>>>>,
     /// Whether the title bar was last made dark (Windows; None before the first frame).
     #[cfg(windows)]
     title_bar_dark: Option<bool>,
@@ -293,9 +298,11 @@ impl App {
             pending_offset: None,
             scroll_delta: 0.0,
             jump: None,
+            jump_until: Instant::now(),
             pending_anchor: None,
             search: SearchState::default(),
             hl: Highlighter::new(ctx.clone()),
+            diagrams: Diagrams::new(ctx.clone()),
             hovered_link: None,
             content_rect: Rect::NOTHING,
             menu: None,
@@ -325,7 +332,7 @@ impl App {
             saved_theme,
             screenshot: args.screenshot.clone(),
             screenshot_delay_ms: args.screenshot_delay_ms,
-            screenshot_requested: false,
+            screenshot_taken: None,
             #[cfg(windows)]
             title_bar_dark: None,
         };
@@ -371,6 +378,7 @@ impl App {
         log::debug!("parsed {} bytes into {} blocks in {:.2} ms", text.len(), doc.blocks.len(), t0.elapsed().as_secs_f64() * 1000.0);
         self.gen += 1;
         self.hl.retain_generation(self.gen);
+        self.diagrams.retain_generation(self.gen);
         self.measures = vec![Measure::default(); doc.blocks.len()];
         self.block_tops = vec![0.0; doc.blocks.len()];
         self.measure_all = doc.blocks.len() <= 600;
@@ -636,6 +644,7 @@ impl App {
 
     fn jump_to_block(&mut self, block: usize) {
         self.jump = Some((block, 6));
+        self.jump_until = Instant::now() + Duration::from_secs(2);
         self.pending_offset = None;
     }
 
@@ -786,7 +795,7 @@ impl App {
         let base = self.settings.base_size;
         let mut picked: Option<MenuItem> = None;
         let mut copy_rect = None;
-        let out = Popup::new(Id::new("context-menu"), ctx.clone(), PopupAnchor::Position(menu.pos), LayerId::background())
+        let out = Popup::new(Id::unique("context-menu"), ctx.clone(), PopupAnchor::Position(menu.pos), LayerId::background())
             .kind(PopupKind::Menu)
             .open(true)
             .close_behavior(PopupCloseBehavior::IgnoreClicks)
@@ -957,7 +966,7 @@ impl App {
 
     fn handle_input(&mut self, ctx: &Context, frame: &eframe::Frame) {
         // Dropped files
-        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).collect());
         if let Some(p) = dropped.into_iter().next() {
             self.open_dropped(p, ctx);
         }
@@ -1098,6 +1107,7 @@ impl App {
         if self.hl.poll() {
             ctx.request_repaint();
         }
+        self.diagrams.poll();
         while let Ok(msg) = self.launch_rx.try_recv() {
             self.set_status(msg);
         }
@@ -1164,7 +1174,7 @@ impl App {
         let min_level = headings.iter().map(|(_, h)| h.level).min().unwrap_or(1);
         let base = self.settings.base_size;
         let pal = self.pal;
-        Panel::left(Id::new("outline"))
+        Panel::left("outline")
             .resizable(true)
             .default_size(280.0)
             .size_range(160.0..=700.0)
@@ -1246,7 +1256,7 @@ impl App {
         let pal = self.pal;
         let current = self.path.clone();
         let mut clicked: Option<PathBuf> = None;
-        Panel::right(Id::new("files"))
+        Panel::right("files")
             .resizable(true)
             .default_size(260.0)
             .size_range(160.0..=700.0)
@@ -1307,7 +1317,7 @@ impl App {
         let mut do_next = false;
         let mut do_prev = false;
         let mut close = false;
-        Panel::top(Id::new("search"))
+        Panel::top("search")
             .resizable(false)
             .frame(Frame::new().fill(pal.panel_bg).inner_margin(Margin::symmetric(14, 8)))
             .show(ui, |ui| {
@@ -1378,7 +1388,7 @@ impl App {
         let base = self.settings.base_size;
         let pal = self.pal;
         let small = base * 0.78;
-        Panel::bottom(Id::new("status"))
+        Panel::bottom("status")
             .resizable(false)
             .show_separator_line(true)
             .frame(Frame::new().fill(pal.panel_bg).inner_margin(Margin::symmetric(12, 5)))
@@ -1538,7 +1548,17 @@ impl App {
         let search = if self.search.open && !self.search.matches.is_empty() { Some(&self.search) } else { None };
         let hovered_link = self.hovered_link;
 
-        let mut rc = RenderCtx::new(&pal, &self.fonts, base, base_dir.as_deref(), self.gen, &mut self.hl, search, hovered_link);
+        let mut rc = RenderCtx::new(
+            &pal,
+            &self.fonts,
+            base,
+            base_dir.as_deref(),
+            self.gen,
+            &mut self.hl,
+            &mut self.diagrams,
+            search,
+            hovered_link,
+        );
         let measures = &mut self.measures;
         let block_tops = &mut self.block_tops;
         let gap = rc.gap();
@@ -1549,6 +1569,7 @@ impl App {
             }
             let visible = ui.clip_rect().expand2(vec2(0.0, ui.clip_rect().height().max(400.0)));
             ui.add_space(base * 1.2);
+            rc.wide = egui::Rangef::new(ui.max_rect().left() + margin, ui.max_rect().right() - margin);
             let col_rect = Rect::from_min_max(
                 pos2(ui.max_rect().left() + left_pad, ui.cursor().top()),
                 pos2(ui.max_rect().left() + left_pad + col_w, ui.max_rect().bottom().max(ui.cursor().top() + 100.0)),
@@ -1604,12 +1625,15 @@ impl App {
             self.hovered_link = new_hovered;
             ctx.request_repaint();
         }
-        self.scroll_offset = out.state.offset.y;
+        self.scroll_offset = out.state.clamped_offset().y;
         self.viewport_h = out.inner_rect.height();
         self.content_h = out.content_size.y;
 
         if let Some((b, left)) = self.jump {
-            if left == 0 {
+            if self.diagrams.laying_out() && Instant::now() < self.jump_until {
+                // Diagrams grow once laid out, which moves the target; hold it in place until
+                // they are (the worker repaints after each one).
+            } else if left == 0 {
                 self.jump = None;
             } else {
                 self.jump = Some((b, left - 1));
@@ -1650,12 +1674,7 @@ impl App {
 
     fn handle_screenshot(&mut self, ctx: &Context) {
         let Some(path) = self.screenshot.clone() else { return };
-        let shot = ctx.input(|i| {
-            i.events.iter().find_map(|e| match e {
-                egui::Event::Screenshot { image, .. } => Some(image.clone()),
-                _ => None,
-            })
-        });
+        let shot = self.screenshot_taken.as_ref().and_then(|taken| taken.lock().take());
         if let Some(img) = shot {
             let [w, h] = img.size;
             crate::cli_console(true);
@@ -1665,12 +1684,13 @@ impl App {
             }
             ctx.send_viewport_cmd(ViewportCommand::Close);
         } else {
-            if !self.screenshot_requested && self.started.elapsed() >= Duration::from_millis(self.screenshot_delay_ms) {
-                self.screenshot_requested = true;
+            if self.screenshot_taken.is_none() && self.started.elapsed() >= Duration::from_millis(self.screenshot_delay_ms) {
+                let taken = Arc::new(egui::mutex::Mutex::new(None));
+                self.screenshot_taken = Some(taken.clone());
                 log::debug!("requesting screenshot at frame {}", self.frames);
-                ctx.send_viewport_cmd(ViewportCommand::Screenshot(egui::UserData::default()));
+                ctx.request_screenshot(move |image| *taken.lock() = Some(image));
             }
-            // Keep frames coming so the Screenshot event is picked up.
+            // Keep frames coming so the screenshot is picked up once taken.
             ctx.request_repaint();
         }
     }

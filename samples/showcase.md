@@ -109,6 +109,24 @@ Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor i
     An indented code block
     with two lines.
 
+## Diagrams
+
+```mermaid
+flowchart LR
+  A[Markdown file] --> B{Changed on disk?}
+  B -- yes --> C[Reload]
+  B -- no --> D[Keep reading]
+  C --> D
+```
+
+```mermaid
+sequenceDiagram
+  participant U as Reader
+  participant V as mdread
+  U->>V: Open file.md#section
+  V-->>U: Rendered page at the heading
+```
+
 ## Block quotes and alerts
 
 > A plain block quote. It can span multiple lines and contain **formatting**, `code`, and [links](#headings).

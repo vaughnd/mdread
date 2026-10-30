@@ -5,18 +5,21 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
+use egui::emath::GuiRounding;
 use egui::scroll_area::ScrollBarVisibility;
 use egui::epaint::text::VariationCoords;
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{
     pos2, vec2, Align, Align2, Button, Color32, CornerRadius, CursorIcon, FontId, Galley, InnerResponse, Label, Layout,
-    Margin, Rect, Response, RichText, Sense, Stroke, Ui, UiBuilder,
+    Margin, Pos2, Rangef, Rect, Response, RichText, Sense, Shape, Stroke, Ui, UiBuilder,
 };
+use egui::layers::ShapeIdx;
 use pulldown_cmark::Alignment;
 
 use crate::document::{Block, CodeBlock, Footnote, ImageRef, Inline, InlineItem, ListItem, QuoteKind, SpanStyle, Table};
 use crate::fonts::FontSet;
 use crate::highlight::Highlighter;
+use crate::mermaid::{self, Diagram, Diagrams, Status};
 use crate::search::SearchState;
 use crate::theme::Palette;
 
@@ -42,17 +45,22 @@ pub struct RenderCtx<'a> {
     pub base_dir: Option<&'a Path>,
     pub gen: u64,
     pub hl: &'a mut Highlighter,
+    pub diagrams: &'a mut Diagrams,
     pub search: Option<&'a SearchState>,
     pub hovered_link: Option<(usize, u32)>,
     pub new_hovered_link: Option<(usize, u32)>,
     pub actions: Vec<Action>,
     pub hover: Hover,
+    /// Horizontal extent that content wider than the column may take, e.g. diagrams.
+    pub wide: Rangef,
     list_depth: u8,
     text_color: Color32,
     scale: f32,
 }
 
 type LinkRanges = Vec<(Range<usize>, u32)>;
+/// Backgrounds of inline code and search matches, relative to their galley.
+type Backgrounds = Vec<(Rect, Color32)>;
 
 impl<'a> RenderCtx<'a> {
     pub fn new(
@@ -62,6 +70,7 @@ impl<'a> RenderCtx<'a> {
         base_dir: Option<&'a Path>,
         gen: u64,
         hl: &'a mut Highlighter,
+        diagrams: &'a mut Diagrams,
         search: Option<&'a SearchState>,
         hovered_link: Option<(usize, u32)>,
     ) -> Self {
@@ -72,11 +81,13 @@ impl<'a> RenderCtx<'a> {
             base_dir,
             gen,
             hl,
+            diagrams,
             search,
             hovered_link,
             new_hovered_link: None,
             actions: Vec::new(),
             hover: Hover::default(),
+            wide: Rangef::NOTHING,
             list_depth: 0,
             text_color: pal.text,
             scale: 1.0,
@@ -158,10 +169,14 @@ impl<'a> RenderCtx<'a> {
         }
         if st.footnote {
             f.color = self.pal.link;
-            f.valign = Align::TOP;
-        } else if st.sup {
+        }
+        // egui centres text that has its own line height and ignores `valign` for it, so
+        // raised and lowered text takes the line height of the text around it instead.
+        if st.footnote || st.sup {
+            f.line_height = None;
             f.valign = Align::TOP;
         } else if st.sub {
+            f.line_height = None;
             f.valign = Align::BOTTOM;
         }
         f
@@ -178,7 +193,7 @@ impl<'a> RenderCtx<'a> {
         halign: Align,
         weight: Option<f32>,
         lh: f32,
-    ) -> (Arc<Galley>, LinkRanges) {
+    ) -> (Arc<Galley>, LinkRanges, Backgrounds) {
         let mut job = LayoutJob {
             wrap: TextWrapping { max_width: wrap_width, ..Default::default() },
             halign,
@@ -203,15 +218,30 @@ impl<'a> RenderCtx<'a> {
                 links.push((start..job.text.len(), l));
             }
         }
+        // egui draws a text background from the top of the text down by the whole line
+        // height, which leaves it half a line low now that it centres text in that height,
+        // so the backgrounds are taken out of the job and drawn around the text instead.
+        let mut fills = Vec::new();
+        if job.sections.iter().any(|s| s.format.background != Color32::TRANSPARENT) {
+            for s in &mut job.sections {
+                let fill = (std::mem::replace(&mut s.format.background, Color32::TRANSPARENT), s.format.expand_bg);
+                fills.extend(std::iter::repeat_n(fill, job.text[s.byte_range.start.0..s.byte_range.end.0].chars().count()));
+            }
+        }
         let galley = ui.painter().layout_job(job);
-        (galley, links)
+        let backgrounds = text_backgrounds(&galley, &fills);
+        (galley, links, backgrounds)
     }
 
     fn show_inline(&mut self, ui: &mut Ui, inline: &Inline, font_size: f32, color: Color32, weight: Option<f32>, lh: f32) -> Response {
         let wrap = ui.available_width().max(10.0);
-        let (galley, links) = self.layout_inline(ui, inline, font_size, color, wrap, Align::LEFT, weight, lh);
+        let (galley, links, backgrounds) = self.layout_inline(ui, inline, font_size, color, wrap, Align::LEFT, weight, lh);
         let sense = if links.is_empty() { Sense::hover() } else { Sense::click() };
+        let slot = (!backgrounds.is_empty()).then(|| ui.painter().add(Shape::Noop));
         let resp = ui.add(Label::new(galley.clone()).sense(sense).selectable(true));
+        if let Some(slot) = slot {
+            paint_backgrounds(ui, slot, resp.rect.min, &backgrounds);
+        }
         if !links.is_empty() {
             self.handle_links(ui, &resp, &galley, &links, inline);
         }
@@ -386,6 +416,19 @@ impl<'a> RenderCtx<'a> {
     }
 
     fn show_code(&mut self, ui: &mut Ui, cb: &CodeBlock) {
+        let mut diagram_error = None;
+        if mermaid::is_mermaid(cb.lang.as_deref()) {
+            match self.diagrams.status(self.gen, &cb.text, self.pal.dark) {
+                Status::Ready(d) => return self.show_diagram(ui, cb, d),
+                Status::Pending => {
+                    let fs = self.fs();
+                    ui.label(RichText::new("Drawing diagram…").italics().color(self.pal.text_dim).size(fs * 0.9));
+                    return;
+                }
+                // Show the source, and why it is not a diagram.
+                Status::Failed(err) => diagram_error = Some(err),
+            }
+        }
         let fs = self.fs();
         let font_size = fs * 0.86;
         let font = FontId::new(font_size, self.fonts.mono.clone());
@@ -458,14 +501,7 @@ impl<'a> RenderCtx<'a> {
         let corner = rect.right_top() + vec2(-pad * 0.6, pad * 0.35);
         if hovered {
             self.hover.code = Some(cb.text.clone());
-            let brect = Rect::from_min_max(corner + vec2(-fs * 3.2, 0.0), corner + vec2(0.0, fs * 1.25));
-            let b = Button::new(RichText::new("copy").size(fs * 0.72)).small();
-            // `place`, not `put`: `put` would move the layout cursor back up to the button,
-            // so every block after a hovered code block would be laid out on top of it.
-            if ui.place(brect, b).clicked() {
-                ui.ctx().copy_text(cb.text.to_string());
-                self.actions.push(Action::Status("Copied code block to clipboard".into()));
-            }
+            self.copy_button(ui, corner, &cb.text, "Copied code block to clipboard");
         } else if has_lang {
             ui.painter().text(
                 corner,
@@ -474,6 +510,73 @@ impl<'a> RenderCtx<'a> {
                 FontId::new(fs * 0.72, self.fonts.sans.clone()),
                 self.pal.text_dim,
             );
+        }
+        if let Some(err) = diagram_error {
+            ui.add_space(fs * 0.3);
+            ui.label(RichText::new(format!("Diagram not drawn: {err}")).color(self.pal.warning).size(fs * 0.8));
+        }
+    }
+
+    /// The "copy" button at the top right corner of a hovered code block or diagram.
+    fn copy_button(&mut self, ui: &mut Ui, corner: Pos2, text: &Arc<str>, status: &str) {
+        let fs = self.fs();
+        let brect = Rect::from_min_max(corner + vec2(-fs * 3.2, 0.0), corner + vec2(0.0, fs * 1.25));
+        let b = Button::new(RichText::new("copy").size(fs * 0.72)).small();
+        // `place`, not `put`: `put` would move the layout cursor back up to the button,
+        // so every block after a hovered code block would be laid out on top of it.
+        if ui.place(brect, b).clicked() {
+            ui.ctx().copy_text(text.to_string());
+            self.actions.push(Action::Status(status.into()));
+        }
+    }
+
+    /// A Mermaid block as its diagram, centred on the column.
+    fn show_diagram(&mut self, ui: &mut Ui, cb: &CodeBlock, d: Diagram) {
+        let fs = self.fs();
+        let ppp = ui.ctx().pixels_per_point();
+        let column = ui.available_rect_before_wrap().x_range();
+        // A diagram wider than the column spreads into the margins beside it.
+        let room = Rangef::new(self.wide.min.min(column.min), self.wide.max.max(column.max));
+        // Mermaid's 16 px labels come out a little smaller than body text. A diagram too wide
+        // for the room is shrunk to fit, down to 40% of that size; wider still, it scrolls.
+        let natural = fs * 0.9 / 16.0;
+        let scale = (room.span() / d.size.x).clamp(natural * 0.4, natural);
+        let size = (d.size * scale * ppp).round() / ppp;
+        let max_side = ui.ctx().input(|i| i.max_texture_side) as f32;
+        let px = size * ppp * (max_side / (size.max_elem() * ppp)).min(1.0);
+        let px = [px.x.round().max(1.0) as usize, px.y.round().max(1.0) as usize];
+
+        let (row, _) = ui.allocate_exact_size(vec2(column.span(), size.y), Sense::hover());
+        let width = size.x.min(room.span());
+        // Not `clamp`: rounding can put `room.max - width` a hair below `room.min`, and clamp panics.
+        let left = (column.center() - width / 2.0).min(room.max - width).max(room.min);
+        let frame = Rect::from_x_y_ranges(left..=left + width, row.y_range());
+        let draw = |this: &mut Self, ui: &mut Ui| {
+            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+            let rect = Rect::from_min_size(rect.min.round_to_pixels(ppp), size);
+            let near = ui.clip_rect().expand2(vec2(0.0, ui.clip_rect().height()));
+            if let Some(texture) = this.diagrams.texture(d, near.intersects(rect).then_some(px)) {
+                let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                ui.painter().image(texture, rect, uv, Color32::WHITE);
+            }
+        };
+        // A child that the column's layout does not grow to include. Its id must not depend
+        // on how many blocks above were laid out, or the sideways scroll would be lost.
+        let mut child = ui.new_child(
+            UiBuilder::new().id_salt(("diagram", cb.id)).max_rect(frame).layout(Layout::top_down(Align::Min)),
+        );
+        if size.x > width + 0.5 {
+            egui::ScrollArea::horizontal()
+                .scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded)
+                .show(&mut child, |ui| draw(self, ui));
+        } else {
+            draw(self, &mut child);
+        }
+        let block = row.union(frame);
+        if ui.rect_contains_pointer(block) {
+            self.hover.code = Some(cb.text.clone());
+            let corner = block.right_top() + vec2(-fs * 0.45, fs * 0.25);
+            self.copy_button(ui, corner, &cb.text, "Copied diagram source to clipboard");
         }
     }
 
@@ -612,7 +715,7 @@ impl<'a> RenderCtx<'a> {
             let weight = if ri == 0 { Some(650.0) } else { None };
             for c in 0..ncols {
                 let cell = row.get(c).unwrap_or(&empty);
-                let (g, _) = self.layout_inline(ui, cell, fs, color, f32::INFINITY, Align::LEFT, weight, 1.4);
+                let (g, _, _) = self.layout_inline(ui, cell, fs, color, f32::INFINITY, Align::LEFT, weight, 1.4);
                 nat[c] = nat[c].max(g.size().x.ceil() + 2.0 * pad_x + 2.0);
             }
         }
@@ -633,7 +736,7 @@ impl<'a> RenderCtx<'a> {
             let mut row_h = 0.0f32;
             for c in 0..ncols {
                 let cell = row.get(c).unwrap_or(&empty);
-                let (g, links) = self.layout_inline(
+                let (g, links, backgrounds) = self.layout_inline(
                     ui,
                     cell,
                     fs,
@@ -644,7 +747,7 @@ impl<'a> RenderCtx<'a> {
                     1.4,
                 );
                 row_h = row_h.max(g.size().y);
-                galleys.push((g, links));
+                galleys.push((g, links, backgrounds));
             }
             let row_h = row_h + 2.0 * pad_y;
             let row_rect = Rect::from_min_size(pos2(left, y), vec2(table_w, row_h));
@@ -656,14 +759,18 @@ impl<'a> RenderCtx<'a> {
             let mut x = left;
             for c in 0..ncols {
                 let cell_rect = Rect::from_min_size(pos2(x + pad_x, y + pad_y), vec2((widths[c] - 2.0 * pad_x).max(8.0), row_h - 2.0 * pad_y));
-                let (g, links) = &galleys[c];
+                let (g, links, backgrounds) = &galleys[c];
                 let sense = if links.is_empty() { Sense::hover() } else { Sense::click() };
                 let g2 = g.clone();
+                let slot = (!backgrounds.is_empty()).then(|| ui.painter().add(Shape::Noop));
                 let resp = ui
                     .scope_builder(UiBuilder::new().max_rect(cell_rect).layout(Layout::top_down(cell_align(c))), |ui| {
                         ui.add(Label::new(g2).sense(sense).selectable(true))
                     })
                     .inner;
+                if let Some(slot) = slot {
+                    paint_backgrounds(ui, slot, resp.rect.min, backgrounds);
+                }
                 if !links.is_empty() {
                     if let Some(cell) = row.get(c) {
                         self.handle_links(ui, &resp, g, links, cell);
@@ -750,6 +857,46 @@ impl<'a> RenderCtx<'a> {
 // ----------------------------------------------------------------------
 // helpers
 // ----------------------------------------------------------------------
+
+/// One rect per run of glyphs with the same fill (colour and margin, one per character of
+/// the job), as tall as the font around the text.
+fn text_backgrounds(galley: &Galley, fills: &[(Color32, f32)]) -> Backgrounds {
+    let mut out = Vec::new();
+    if fills.is_empty() {
+        return out;
+    }
+    // egui lays out one glyph per character, so the n-th glyph is the n-th character.
+    let mut first_char = 0;
+    for placed in &galley.rows {
+        let mut run: Option<(Rect, Color32, f32)> = None;
+        for (i, g) in placed.row.glyphs.iter().enumerate() {
+            let (color, expand) = fills.get(first_char + i).copied().unwrap_or((Color32::TRANSPARENT, 0.0));
+            let rect = Rect::from_min_size(placed.pos + vec2(g.pos.x, g.pos.y - g.font_ascent), vec2(g.advance_width, g.font_height));
+            match &mut run {
+                Some((r, c, e)) if *c == color && *e == expand && r.y_range() == rect.y_range() => r.max.x = rect.max.x,
+                _ => {
+                    out.extend(run.take().map(|(r, c, e)| (r.expand(e), c)));
+                    if color != Color32::TRANSPARENT {
+                        run = Some((rect, color, expand));
+                    }
+                }
+            }
+        }
+        out.extend(run.map(|(r, c, e)| (r.expand(e), c)));
+        first_char += placed.char_count_including_newline().0;
+    }
+    out
+}
+
+/// Fills `slot`, a shape added before the galley at `origin` was, with its backgrounds.
+fn paint_backgrounds(ui: &Ui, slot: ShapeIdx, origin: Pos2, backgrounds: &Backgrounds) {
+    let ppp = ui.pixels_per_point();
+    let shapes = backgrounds
+        .iter()
+        .map(|(r, c)| Shape::rect_filled(r.translate(origin.to_vec2()).round_to_pixels(ppp), CornerRadius::ZERO, *c))
+        .collect();
+    ui.painter().set(slot, Shape::Vec(shapes));
+}
 
 fn append_highlighted(
     job: &mut LayoutJob,
