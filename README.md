@@ -21,6 +21,10 @@ code with syntect.
   images (PNG, JPEG, GIF, WebP, SVG), inline badges, HTML `<img>`.
 - Links: web links open in the browser, relative `.md` links open in the
   viewer (with back/forward), `#anchors` jump within the document.
+- Mermaid diagrams (```` ```mermaid ```` blocks) drawn natively, without a
+  browser: flowcharts, sequence, class, state, ER, gantt, pie and the other
+  Mermaid types, in Mermaid's dark theme on the dark page. A diagram wider than
+  the column spreads into the margins beside it.
 - Search with highlighted matches, copy button on code blocks, text selection,
   right-click menu to copy the selection or open and copy links.
 
@@ -189,6 +193,14 @@ $env:MDREAD_MONO_FONT = 'consola.ttf'
 
 egui renders text with greyscale antialiasing (no ClearType) and monochrome
 emoji, and lays out Arabic and Hebrew left to right without shaping.
+
+Diagram labels use Trebuchet MS, Mermaid's default font, because the labels are
+sized with its metrics. Windows and macOS have it; on Linux it comes with the
+Microsoft core fonts (`ttf-mscorefonts-installer`), and without it diagrams use
+Arial, Liberation Sans, Helvetica, Noto Sans or DejaVu Sans, which can make some
+labels run slightly past their boxes. Characters those fonts lack are taken from
+any installed font that has them. The installed fonts are scanned the first time
+a document has a diagram.
 
 ## Debugging
 

@@ -8,6 +8,7 @@ mod files;
 mod fonts;
 mod highlight;
 mod links;
+mod mermaid;
 mod render;
 mod search;
 #[cfg(windows)]
@@ -122,7 +123,11 @@ fn app_icon() -> egui::IconData {
 }
 
 fn init_logging() {
-    let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"));
+    // usvg, its CSS parser and tiny-skia warn about routine things in diagrams (a fallback
+    // font for each character a font lacks, CSS selectors they skip, unfillable straight
+    // paths); RUST_LOG still shows them.
+    let filter = "warn,usvg=error,simplecss=error,tiny_skia=error";
+    let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(filter));
     // Release builds on Windows have no stderr; send RUST_LOG output to a file instead.
     #[cfg(windows)]
     if !cfg!(debug_assertions) && std::env::var_os("RUST_LOG").is_some() {

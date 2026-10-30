@@ -5,18 +5,20 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
+use egui::emath::GuiRounding;
 use egui::scroll_area::ScrollBarVisibility;
 use egui::epaint::text::VariationCoords;
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{
     pos2, vec2, Align, Align2, Button, Color32, CornerRadius, CursorIcon, FontId, Galley, InnerResponse, Label, Layout,
-    Margin, Rect, Response, RichText, Sense, Stroke, Ui, UiBuilder,
+    Margin, Pos2, Rangef, Rect, Response, RichText, Sense, Stroke, Ui, UiBuilder,
 };
 use pulldown_cmark::Alignment;
 
 use crate::document::{Block, CodeBlock, Footnote, ImageRef, Inline, InlineItem, ListItem, QuoteKind, SpanStyle, Table};
 use crate::fonts::FontSet;
 use crate::highlight::Highlighter;
+use crate::mermaid::{self, Diagram, Diagrams, Status};
 use crate::search::SearchState;
 use crate::theme::Palette;
 
@@ -42,11 +44,14 @@ pub struct RenderCtx<'a> {
     pub base_dir: Option<&'a Path>,
     pub gen: u64,
     pub hl: &'a mut Highlighter,
+    pub diagrams: &'a mut Diagrams,
     pub search: Option<&'a SearchState>,
     pub hovered_link: Option<(usize, u32)>,
     pub new_hovered_link: Option<(usize, u32)>,
     pub actions: Vec<Action>,
     pub hover: Hover,
+    /// Horizontal extent that content wider than the column may take, e.g. diagrams.
+    pub wide: Rangef,
     list_depth: u8,
     text_color: Color32,
     scale: f32,
@@ -62,6 +67,7 @@ impl<'a> RenderCtx<'a> {
         base_dir: Option<&'a Path>,
         gen: u64,
         hl: &'a mut Highlighter,
+        diagrams: &'a mut Diagrams,
         search: Option<&'a SearchState>,
         hovered_link: Option<(usize, u32)>,
     ) -> Self {
@@ -72,11 +78,13 @@ impl<'a> RenderCtx<'a> {
             base_dir,
             gen,
             hl,
+            diagrams,
             search,
             hovered_link,
             new_hovered_link: None,
             actions: Vec::new(),
             hover: Hover::default(),
+            wide: Rangef::NOTHING,
             list_depth: 0,
             text_color: pal.text,
             scale: 1.0,
@@ -386,6 +394,19 @@ impl<'a> RenderCtx<'a> {
     }
 
     fn show_code(&mut self, ui: &mut Ui, cb: &CodeBlock) {
+        let mut diagram_error = None;
+        if mermaid::is_mermaid(cb.lang.as_deref()) {
+            match self.diagrams.status(self.gen, &cb.text, self.pal.dark) {
+                Status::Ready(d) => return self.show_diagram(ui, cb, d),
+                Status::Pending => {
+                    let fs = self.fs();
+                    ui.label(RichText::new("Drawing diagram…").italics().color(self.pal.text_dim).size(fs * 0.9));
+                    return;
+                }
+                // Show the source, and why it is not a diagram.
+                Status::Failed(err) => diagram_error = Some(err),
+            }
+        }
         let fs = self.fs();
         let font_size = fs * 0.86;
         let font = FontId::new(font_size, self.fonts.mono.clone());
@@ -458,14 +479,7 @@ impl<'a> RenderCtx<'a> {
         let corner = rect.right_top() + vec2(-pad * 0.6, pad * 0.35);
         if hovered {
             self.hover.code = Some(cb.text.clone());
-            let brect = Rect::from_min_max(corner + vec2(-fs * 3.2, 0.0), corner + vec2(0.0, fs * 1.25));
-            let b = Button::new(RichText::new("copy").size(fs * 0.72)).small();
-            // `place`, not `put`: `put` would move the layout cursor back up to the button,
-            // so every block after a hovered code block would be laid out on top of it.
-            if ui.place(brect, b).clicked() {
-                ui.ctx().copy_text(cb.text.to_string());
-                self.actions.push(Action::Status("Copied code block to clipboard".into()));
-            }
+            self.copy_button(ui, corner, &cb.text, "Copied code block to clipboard");
         } else if has_lang {
             ui.painter().text(
                 corner,
@@ -474,6 +488,73 @@ impl<'a> RenderCtx<'a> {
                 FontId::new(fs * 0.72, self.fonts.sans.clone()),
                 self.pal.text_dim,
             );
+        }
+        if let Some(err) = diagram_error {
+            ui.add_space(fs * 0.3);
+            ui.label(RichText::new(format!("Diagram not drawn: {err}")).color(self.pal.warning).size(fs * 0.8));
+        }
+    }
+
+    /// The "copy" button at the top right corner of a hovered code block or diagram.
+    fn copy_button(&mut self, ui: &mut Ui, corner: Pos2, text: &Arc<str>, status: &str) {
+        let fs = self.fs();
+        let brect = Rect::from_min_max(corner + vec2(-fs * 3.2, 0.0), corner + vec2(0.0, fs * 1.25));
+        let b = Button::new(RichText::new("copy").size(fs * 0.72)).small();
+        // `place`, not `put`: `put` would move the layout cursor back up to the button,
+        // so every block after a hovered code block would be laid out on top of it.
+        if ui.place(brect, b).clicked() {
+            ui.ctx().copy_text(text.to_string());
+            self.actions.push(Action::Status(status.into()));
+        }
+    }
+
+    /// A Mermaid block as its diagram, centred on the column.
+    fn show_diagram(&mut self, ui: &mut Ui, cb: &CodeBlock, d: Diagram) {
+        let fs = self.fs();
+        let ppp = ui.ctx().pixels_per_point();
+        let column = ui.available_rect_before_wrap().x_range();
+        // A diagram wider than the column spreads into the margins beside it.
+        let room = Rangef::new(self.wide.min.min(column.min), self.wide.max.max(column.max));
+        // Mermaid's 16 px labels come out a little smaller than body text. A diagram too wide
+        // for the room is shrunk to fit, down to 40% of that size; wider still, it scrolls.
+        let natural = fs * 0.9 / 16.0;
+        let scale = (room.span() / d.size.x).clamp(natural * 0.4, natural);
+        let size = (d.size * scale * ppp).round() / ppp;
+        let max_side = ui.ctx().input(|i| i.max_texture_side) as f32;
+        let px = size * ppp * (max_side / (size.max_elem() * ppp)).min(1.0);
+        let px = [px.x.round().max(1.0) as usize, px.y.round().max(1.0) as usize];
+
+        let (row, _) = ui.allocate_exact_size(vec2(column.span(), size.y), Sense::hover());
+        let width = size.x.min(room.span());
+        // Not `clamp`: rounding can put `room.max - width` a hair below `room.min`, and clamp panics.
+        let left = (column.center() - width / 2.0).min(room.max - width).max(room.min);
+        let frame = Rect::from_x_y_ranges(left..=left + width, row.y_range());
+        let draw = |this: &mut Self, ui: &mut Ui| {
+            let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+            let rect = Rect::from_min_size(rect.min.round_to_pixels(ppp), size);
+            let near = ui.clip_rect().expand2(vec2(0.0, ui.clip_rect().height()));
+            if let Some(texture) = this.diagrams.texture(d, near.intersects(rect).then_some(px)) {
+                let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+                ui.painter().image(texture, rect, uv, Color32::WHITE);
+            }
+        };
+        // A child that the column's layout does not grow to include. Its id must not depend
+        // on how many blocks above were laid out, or the sideways scroll would be lost.
+        let mut child = ui.new_child(
+            UiBuilder::new().id_salt(("diagram", cb.id)).max_rect(frame).layout(Layout::top_down(Align::Min)),
+        );
+        if size.x > width + 0.5 {
+            egui::ScrollArea::horizontal()
+                .scroll_bar_visibility(ScrollBarVisibility::VisibleWhenNeeded)
+                .show(&mut child, |ui| draw(self, ui));
+        } else {
+            draw(self, &mut child);
+        }
+        let block = row.union(frame);
+        if ui.rect_contains_pointer(block) {
+            self.hover.code = Some(cb.text.clone());
+            let corner = block.right_top() + vec2(-fs * 0.45, fs * 0.25);
+            self.copy_button(ui, corner, &cb.text, "Copied diagram source to clipboard");
         }
     }
 

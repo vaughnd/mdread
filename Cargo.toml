@@ -23,6 +23,14 @@ dunce = "1"
 # Text files that are not UTF-8: BOM-tagged UTF-16, or the legacy ANSI code page.
 encoding_rs = "0.8"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Mermaid diagrams, laid out as SVG without a browser. Pinned: later releases need rustc 1.95.
+merman = { version = "=0.7.0-alpha.1", features = ["render"] }
+# Same version as egui_extras uses. Draws the diagrams, and on Windows backs the SVG loader
+# that restricts <image href>.
+resvg = { version = "0.45.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
+# The version resvg uses; to find a font for a character that diagram fonts lack.
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
 env_logger = { version = "0.11", default-features = false }
 log = "0.4"
 
@@ -41,8 +49,6 @@ wgpu = { version = "29", default-features = false, features = ["std", "parking_l
 rfd = { version = "0.17", default-features = false }
 # The window handle eframe gives out, for the dialog owner and the title bar colour.
 raw-window-handle = "0.6"
-# Same version as egui_extras uses; for the SVG loader that restricts <image href>.
-resvg = { version = "0.45.1", default-features = false }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Globalization",
