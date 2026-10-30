@@ -11,8 +11,9 @@ use egui::epaint::text::VariationCoords;
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
 use egui::{
     pos2, vec2, Align, Align2, Button, Color32, CornerRadius, CursorIcon, FontId, Galley, InnerResponse, Label, Layout,
-    Margin, Pos2, Rangef, Rect, Response, RichText, Sense, Stroke, Ui, UiBuilder,
+    Margin, Pos2, Rangef, Rect, Response, RichText, Sense, Shape, Stroke, Ui, UiBuilder,
 };
+use egui::layers::ShapeIdx;
 use pulldown_cmark::Alignment;
 
 use crate::document::{Block, CodeBlock, Footnote, ImageRef, Inline, InlineItem, ListItem, QuoteKind, SpanStyle, Table};
@@ -58,6 +59,8 @@ pub struct RenderCtx<'a> {
 }
 
 type LinkRanges = Vec<(Range<usize>, u32)>;
+/// Backgrounds of inline code and search matches, relative to their galley.
+type Backgrounds = Vec<(Rect, Color32)>;
 
 impl<'a> RenderCtx<'a> {
     pub fn new(
@@ -190,7 +193,7 @@ impl<'a> RenderCtx<'a> {
         halign: Align,
         weight: Option<f32>,
         lh: f32,
-    ) -> (Arc<Galley>, LinkRanges) {
+    ) -> (Arc<Galley>, LinkRanges, Backgrounds) {
         let mut job = LayoutJob {
             wrap: TextWrapping { max_width: wrap_width, ..Default::default() },
             halign,
@@ -215,15 +218,30 @@ impl<'a> RenderCtx<'a> {
                 links.push((start..job.text.len(), l));
             }
         }
+        // egui draws a text background from the top of the text down by the whole line
+        // height, which leaves it half a line low now that it centres text in that height,
+        // so the backgrounds are taken out of the job and drawn around the text instead.
+        let mut fills = Vec::new();
+        if job.sections.iter().any(|s| s.format.background != Color32::TRANSPARENT) {
+            for s in &mut job.sections {
+                let fill = (std::mem::replace(&mut s.format.background, Color32::TRANSPARENT), s.format.expand_bg);
+                fills.extend(std::iter::repeat_n(fill, job.text[s.byte_range.start.0..s.byte_range.end.0].chars().count()));
+            }
+        }
         let galley = ui.painter().layout_job(job);
-        (galley, links)
+        let backgrounds = text_backgrounds(&galley, &fills);
+        (galley, links, backgrounds)
     }
 
     fn show_inline(&mut self, ui: &mut Ui, inline: &Inline, font_size: f32, color: Color32, weight: Option<f32>, lh: f32) -> Response {
         let wrap = ui.available_width().max(10.0);
-        let (galley, links) = self.layout_inline(ui, inline, font_size, color, wrap, Align::LEFT, weight, lh);
+        let (galley, links, backgrounds) = self.layout_inline(ui, inline, font_size, color, wrap, Align::LEFT, weight, lh);
         let sense = if links.is_empty() { Sense::hover() } else { Sense::click() };
+        let slot = (!backgrounds.is_empty()).then(|| ui.painter().add(Shape::Noop));
         let resp = ui.add(Label::new(galley.clone()).sense(sense).selectable(true));
+        if let Some(slot) = slot {
+            paint_backgrounds(ui, slot, resp.rect.min, &backgrounds);
+        }
         if !links.is_empty() {
             self.handle_links(ui, &resp, &galley, &links, inline);
         }
@@ -697,7 +715,7 @@ impl<'a> RenderCtx<'a> {
             let weight = if ri == 0 { Some(650.0) } else { None };
             for c in 0..ncols {
                 let cell = row.get(c).unwrap_or(&empty);
-                let (g, _) = self.layout_inline(ui, cell, fs, color, f32::INFINITY, Align::LEFT, weight, 1.4);
+                let (g, _, _) = self.layout_inline(ui, cell, fs, color, f32::INFINITY, Align::LEFT, weight, 1.4);
                 nat[c] = nat[c].max(g.size().x.ceil() + 2.0 * pad_x + 2.0);
             }
         }
@@ -718,7 +736,7 @@ impl<'a> RenderCtx<'a> {
             let mut row_h = 0.0f32;
             for c in 0..ncols {
                 let cell = row.get(c).unwrap_or(&empty);
-                let (g, links) = self.layout_inline(
+                let (g, links, backgrounds) = self.layout_inline(
                     ui,
                     cell,
                     fs,
@@ -729,7 +747,7 @@ impl<'a> RenderCtx<'a> {
                     1.4,
                 );
                 row_h = row_h.max(g.size().y);
-                galleys.push((g, links));
+                galleys.push((g, links, backgrounds));
             }
             let row_h = row_h + 2.0 * pad_y;
             let row_rect = Rect::from_min_size(pos2(left, y), vec2(table_w, row_h));
@@ -741,14 +759,18 @@ impl<'a> RenderCtx<'a> {
             let mut x = left;
             for c in 0..ncols {
                 let cell_rect = Rect::from_min_size(pos2(x + pad_x, y + pad_y), vec2((widths[c] - 2.0 * pad_x).max(8.0), row_h - 2.0 * pad_y));
-                let (g, links) = &galleys[c];
+                let (g, links, backgrounds) = &galleys[c];
                 let sense = if links.is_empty() { Sense::hover() } else { Sense::click() };
                 let g2 = g.clone();
+                let slot = (!backgrounds.is_empty()).then(|| ui.painter().add(Shape::Noop));
                 let resp = ui
                     .scope_builder(UiBuilder::new().max_rect(cell_rect).layout(Layout::top_down(cell_align(c))), |ui| {
                         ui.add(Label::new(g2).sense(sense).selectable(true))
                     })
                     .inner;
+                if let Some(slot) = slot {
+                    paint_backgrounds(ui, slot, resp.rect.min, backgrounds);
+                }
                 if !links.is_empty() {
                     if let Some(cell) = row.get(c) {
                         self.handle_links(ui, &resp, g, links, cell);
@@ -835,6 +857,46 @@ impl<'a> RenderCtx<'a> {
 // ----------------------------------------------------------------------
 // helpers
 // ----------------------------------------------------------------------
+
+/// One rect per run of glyphs with the same fill (colour and margin, one per character of
+/// the job), as tall as the font around the text.
+fn text_backgrounds(galley: &Galley, fills: &[(Color32, f32)]) -> Backgrounds {
+    let mut out = Vec::new();
+    if fills.is_empty() {
+        return out;
+    }
+    // egui lays out one glyph per character, so the n-th glyph is the n-th character.
+    let mut first_char = 0;
+    for placed in &galley.rows {
+        let mut run: Option<(Rect, Color32, f32)> = None;
+        for (i, g) in placed.row.glyphs.iter().enumerate() {
+            let (color, expand) = fills.get(first_char + i).copied().unwrap_or((Color32::TRANSPARENT, 0.0));
+            let rect = Rect::from_min_size(placed.pos + vec2(g.pos.x, g.pos.y - g.font_ascent), vec2(g.advance_width, g.font_height));
+            match &mut run {
+                Some((r, c, e)) if *c == color && *e == expand && r.y_range() == rect.y_range() => r.max.x = rect.max.x,
+                _ => {
+                    out.extend(run.take().map(|(r, c, e)| (r.expand(e), c)));
+                    if color != Color32::TRANSPARENT {
+                        run = Some((rect, color, expand));
+                    }
+                }
+            }
+        }
+        out.extend(run.map(|(r, c, e)| (r.expand(e), c)));
+        first_char += placed.char_count_including_newline().0;
+    }
+    out
+}
+
+/// Fills `slot`, a shape added before the galley at `origin` was, with its backgrounds.
+fn paint_backgrounds(ui: &Ui, slot: ShapeIdx, origin: Pos2, backgrounds: &Backgrounds) {
+    let ppp = ui.pixels_per_point();
+    let shapes = backgrounds
+        .iter()
+        .map(|(r, c)| Shape::rect_filled(r.translate(origin.to_vec2()).round_to_pixels(ppp), CornerRadius::ZERO, *c))
+        .collect();
+    ui.painter().set(slot, Shape::Vec(shapes));
+}
 
 fn append_highlighted(
     job: &mut LayoutJob,

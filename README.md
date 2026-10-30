@@ -195,13 +195,12 @@ $env:MDREAD_MONO_FONT = 'consola.ttf'
 egui renders text with greyscale antialiasing (no ClearType) and monochrome
 emoji, and lays out Arabic and Hebrew left to right without shaping.
 
-Diagram labels use Trebuchet MS, Mermaid's default font, because the labels are
-sized with its metrics. Windows and macOS have it; on Linux it comes with the
-Microsoft core fonts (`ttf-mscorefonts-installer`), and without it diagrams use
-Arial, Liberation Sans, Helvetica, Noto Sans or DejaVu Sans, which can make some
-labels run slightly past their boxes. Characters those fonts lack are taken from
-any installed font that has them. The installed fonts are scanned the first time
-a document has a diagram.
+Diagram labels use Trebuchet MS, Mermaid's default font. Windows and macOS have
+it; on Linux it comes with the Microsoft core fonts (`ttf-mscorefonts-installer`),
+and without it diagrams use Arial, Liberation Sans, Helvetica, Noto Sans or
+DejaVu Sans. Boxes are sized to the labels as that font draws them. Characters
+those fonts lack are taken from any installed font that has them. The installed
+fonts are scanned the first time a document has a diagram.
 
 ## Debugging
 

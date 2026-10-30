@@ -10,7 +10,10 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui::{vec2, ColorImage, TextureHandle, TextureId, TextureOptions, Vec2};
-use merman::svg::{RootBackgroundPostprocessor, SvgPipeline};
+use merman::svg::{
+    DeterministicTextMeasurer, MeasurementProfileId, RootBackgroundPostprocessor, SvgEnvironment, SvgPipeline,
+    TextMeasurementPolicy, TextMeasurementProfile, TextMeasurementProfileIdentity, TextStyle,
+};
 use merman::{Engine, MermaidConfig, OperationControl, RenderError, RenderOutput, RenderRequest, Renderer, SvgRequest};
 use resvg::tiny_skia;
 use resvg::usvg::{self, fontdb};
@@ -219,7 +222,7 @@ fn worker(rx: mpsc::Receiver<Job>, tx: mpsc::Sender<Done>, ctx: egui::Context) {
                     Renderer::new().with_engine(Engine::new().with_site_config(config))
                 });
                 let fonts = fonts.get_or_insert_with(Fonts::load);
-                let result = match lay_out(renderer, &source) {
+                let result = match lay_out(renderer, &fonts.environment, &source) {
                     Ok(Some(svg)) => fonts.parse(&svg).map(Arc::new).map_err(|e| format!("cannot read the SVG: {e}")),
                     Ok(None) => Err("not a Mermaid diagram".into()),
                     Err(RenderError::Cancelled(_)) => Err("it took too long to lay out".into()),
@@ -239,8 +242,9 @@ fn worker(rx: mpsc::Receiver<Job>, tx: mpsc::Sender<Done>, ctx: egui::Context) {
 
 /// The diagram as SVG that usvg can draw: labels as SVG text rather than HTML, and no
 /// background, so that it sits on the page in either theme.
-fn lay_out(renderer: &Renderer, source: &str) -> Result<Option<String>, RenderError> {
+fn lay_out(renderer: &Renderer, environment: &SvgEnvironment, source: &str) -> Result<Option<String>, RenderError> {
     let request = SvgRequest {
+        environment: environment.clone(),
         pipeline: Some(SvgPipeline::resvg_safe().with_postprocessor(RootBackgroundPostprocessor::new("transparent"))),
         ..Default::default()
     };
@@ -264,17 +268,19 @@ fn rasterize(tree: &usvg::Tree, [w, h]: [usize; 2]) -> ColorImage {
     ColorImage::from_rgba_premultiplied([w, h], pixmap.data())
 }
 
-/// Fonts for diagram text. merman sizes labels with the metrics of Trebuchet MS, Mermaid's
-/// default font, so that is used where installed (Windows, macOS, Linux with the Microsoft
-/// core fonts), else a sans-serif of similar width. usvg only searches the few fonts loaded
-/// here, which keeps text layout fast (all system fonts make it 50 times slower); a font
-/// for a character these lack is loaded the first time one is needed.
+/// Fonts for diagram text: Trebuchet MS, Mermaid's default font, where installed (Windows,
+/// macOS, Linux with the Microsoft core fonts), else a sans-serif of similar width. usvg
+/// only searches the few fonts loaded here, which keeps text layout fast (all system fonts
+/// make it 50 times slower); a font for a character these lack is loaded the first time
+/// one is needed.
 struct Fonts {
     db: Arc<fontdb::Database>,
     /// Every installed font, of which only the names have been read.
     system: fontdb::Database,
     /// Characters that no installed font has.
     missing: Mutex<HashSet<char>>,
+    /// Lays diagrams out with the widths these fonts draw the labels at.
+    environment: SvgEnvironment,
 }
 
 impl Fonts {
@@ -307,7 +313,14 @@ impl Fonts {
             system.len(),
             t0.elapsed().as_secs_f64() * 1000.0
         );
-        Self { db: Arc::new(db), system, missing: Mutex::new(HashSet::new()) }
+        let widths = TextWidths::new(&db, sans.as_deref(), mono.as_deref());
+        let measurer = DeterministicTextMeasurer::default().with_width_callback(move |text, style| widths.width(text, style));
+        let identity = MeasurementProfileId::new("mdread.diagram-fonts")
+            .and_then(|id| TextMeasurementProfileIdentity::new(id, env!("CARGO_PKG_VERSION")))
+            .expect("profile name and version are not empty");
+        let policy = TextMeasurementPolicy::uniform(TextMeasurementProfile::new(identity, measurer));
+        let environment = SvgEnvironment::deterministic().with_text_measurement_policy(policy);
+        Self { db: Arc::new(db), system, missing: Mutex::new(HashSet::new()), environment }
     }
 
     fn parse(&mut self, svg: &str) -> Result<usvg::Tree, usvg::Error> {
@@ -323,6 +336,69 @@ impl Fonts {
         // Keep the fallback fonts loaded for this diagram for the next ones.
         self.db = tree.fontdb().clone();
         Ok(tree)
+    }
+}
+
+/// A font file's data and the index of a face in it.
+type FaceFile = (Arc<[u8]>, u32);
+
+/// How wide usvg will draw a label. merman's own estimate is narrower than Trebuchet MS
+/// draws most text, which leaves labels running past their boxes and edge labels into each
+/// other.
+struct TextWidths {
+    /// Regular, bold, italic and bold italic faces of the sans-serif font, then of the
+    /// monospace one.
+    faces: [Option<FaceFile>; 8],
+}
+
+impl TextWidths {
+    fn new(db: &fontdb::Database, sans: Option<&str>, mono: Option<&str>) -> Self {
+        let mut files: Vec<(fontdb::ID, FaceFile)> = Vec::new();
+        let faces = std::array::from_fn(|i| {
+            let query = fontdb::Query {
+                families: &[fontdb::Family::Name(if i < 4 { sans? } else { mono? })],
+                weight: if i & 1 == 1 { fontdb::Weight::BOLD } else { fontdb::Weight::NORMAL },
+                style: if i & 2 == 2 { fontdb::Style::Italic } else { fontdb::Style::Normal },
+                ..Default::default()
+            };
+            let id = db.query(&query)?;
+            if let Some((_, file)) = files.iter().find(|(loaded, _)| *loaded == id) {
+                return Some(file.clone());
+            }
+            let file = db.with_face_data(id, |data, index| (Arc::from(data), index))?;
+            files.push((id, file.clone()));
+            Some(file)
+        });
+        Self { faces }
+    }
+
+    fn width(&self, text: &str, style: &TextStyle) -> f64 {
+        let family = style.font_family.as_deref().unwrap_or_default().to_ascii_lowercase();
+        let mono = ["mono", "courier", "consolas", "menlo"].iter().any(|m| family.contains(m));
+        let bold = style.font_weight.as_deref().is_some_and(|w| w.starts_with("bold") || w.parse::<u16>().is_ok_and(|w| w >= 600));
+        let italic = matches!(style.font_style.as_deref(), Some("italic" | "oblique"));
+        let size = style.font_size;
+        // Characters the font lacks are drawn with another one; an em for the wide ones.
+        let guess = |c: char| {
+            let wide = matches!(c, '\u{1100}'..='\u{115F}' | '\u{2E80}'..='\u{A4CF}' | '\u{AC00}'..='\u{D7A3}'
+                | '\u{F900}'..='\u{FAFF}' | '\u{FF00}'..='\u{FF60}' | '\u{1F300}'..='\u{1FAFF}' | '\u{20000}'..);
+            size * if wide { 1.0 } else { 0.6 }
+        };
+        let face = self.faces[mono as usize * 4 + italic as usize * 2 + bold as usize]
+            .as_ref()
+            .and_then(|(data, index)| rustybuzz::Face::from_slice(data, *index));
+        let Some(face) = face else { return text.chars().map(guess).sum() };
+        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        buffer.push_str(text);
+        let shaped = rustybuzz::shape(&face, &[], buffer);
+        let scale = size / f64::from(face.units_per_em());
+        let glyphs = shaped.glyph_infos().iter().zip(shaped.glyph_positions());
+        glyphs
+            .map(|(glyph, pos)| match glyph.glyph_id {
+                0 => text.get(glyph.cluster as usize..).and_then(|t| t.chars().next()).map_or(0.0, guess),
+                _ => f64::from(pos.x_advance) * scale,
+            })
+            .sum()
     }
 }
 

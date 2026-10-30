@@ -34,6 +34,8 @@ merman = { version = "0.9.3", default-features = false, features = ["all-diagram
 resvg = { version = "0.45.1", default-features = false, features = ["text", "system-fonts", "memmap-fonts"] }
 # The version resvg uses; to find a font for a character that diagram fonts lack.
 ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+# The shaper usvg uses, to tell merman how wide diagram labels will be drawn.
+rustybuzz = "0.20.1"
 env_logger = { version = "0.11", default-features = false }
 log = "0.4"
 

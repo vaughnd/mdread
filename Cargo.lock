@@ -1878,6 +1878,7 @@ dependencies = [
  "raw-window-handle",
  "resvg",
  "rfd",
+ "rustybuzz",
  "serde",
  "serde_json",
  "syntect",
