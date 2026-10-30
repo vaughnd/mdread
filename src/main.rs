@@ -125,8 +125,9 @@ fn app_icon() -> egui::IconData {
 fn init_logging() {
     // usvg, its CSS parser and tiny-skia warn about routine things in diagrams (a fallback
     // font for each character a font lacks, CSS selectors they skip, unfillable straight
-    // paths); RUST_LOG still shows them.
-    let filter = "warn,usvg=error,simplecss=error,tiny_skia=error";
+    // paths); RUST_LOG still shows them. arboard warns at startup on GNOME, which lacks the
+    // Wayland clipboard protocol it tries first; egui uses smithay-clipboard there anyway.
+    let filter = "warn,usvg=error,simplecss=error,tiny_skia=error,arboard::platform::linux=error,arboard::platform::linux::x11=warn";
     let mut builder = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(filter));
     // Release builds on Windows have no stderr; send RUST_LOG output to a file instead.
     #[cfg(windows)]
