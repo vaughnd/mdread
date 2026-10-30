@@ -166,10 +166,14 @@ impl<'a> RenderCtx<'a> {
         }
         if st.footnote {
             f.color = self.pal.link;
-            f.valign = Align::TOP;
-        } else if st.sup {
+        }
+        // egui centres text that has its own line height and ignores `valign` for it, so
+        // raised and lowered text takes the line height of the text around it instead.
+        if st.footnote || st.sup {
+            f.line_height = None;
             f.valign = Align::TOP;
         } else if st.sub {
+            f.line_height = None;
             f.valign = Align::BOTTOM;
         }
         f

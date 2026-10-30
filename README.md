@@ -36,8 +36,9 @@ cargo build --release          # binary at target/release/mdread
                                # icons, and makes mdread the default for Markdown files
 ```
 
-Requires rustc 1.92+ (Ubuntu 26.04 ships 1.93 and cargo via `apt install cargo`).
-No system GUI libraries are needed beyond Mesa/Wayland/X11 runtime libraries.
+Requires rustc 1.95+. Ubuntu 26.04's own Rust packages stop at 1.93, so install
+the toolchain with rustup: `sudo apt install rustup && rustup default stable`
+(this replaces the `cargo` and `rustc` packages). No system GUI libraries are needed beyond Mesa/Wayland/X11 runtime libraries.
 No packaging (.deb) is needed: a per-user desktop entry is enough for GNOME,
 Nautilus and `xdg-open`. The installer writes the binary's absolute path into
 the entry because GNOME launches apps with a `PATH` that does not include

@@ -9,6 +9,6 @@ rustflags = ["-C", "target-feature=+crt-static"]
 rustflags = ["-C", "target-feature=+crt-static"]
 
 # Resolve to dependency versions that build with the package's rust-version, so that
-# `cargo update` does not move merman's own crates to releases that need rustc 1.95.
+# `cargo update` does not pick releases that need a newer rustc than the README asks for.
 [resolver]
 incompatible-rust-versions = "fallback"

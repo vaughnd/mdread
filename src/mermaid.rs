@@ -7,10 +7,11 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use egui::{vec2, ColorImage, TextureHandle, TextureId, TextureOptions, Vec2};
-use merman::render::HeadlessRenderer;
+use merman::svg::{RootBackgroundPostprocessor, SvgPipeline};
+use merman::{Engine, MermaidConfig, OperationControl, RenderError, RenderOutput, RenderRequest, Renderer, SvgRequest};
 use resvg::tiny_skia;
 use resvg::usvg::{self, fontdb};
 
@@ -20,6 +21,9 @@ const PAD: f32 = 6.0;
 /// Textures of diagrams that are not on screen are dropped above this total, and drawn
 /// again when scrolled back to.
 const TEXTURE_BUDGET: usize = 256 << 20;
+/// A diagram that takes longer than this to lay out is given up on, so that the ones after
+/// it are still drawn.
+const LAYOUT_DEADLINE: Duration = Duration::from_secs(10);
 
 /// Whether a fenced code block's info string asks for a Mermaid diagram.
 pub fn is_mermaid(lang: Option<&str>) -> bool {
@@ -189,7 +193,7 @@ impl Diagrams {
 }
 
 fn worker(rx: mpsc::Receiver<Job>, tx: mpsc::Sender<Done>, ctx: egui::Context) {
-    let mut renderers: [Option<HeadlessRenderer>; 2] = [None, None];
+    let mut renderers: [Option<Renderer>; 2] = [None, None];
     let mut fonts: Option<Fonts> = None;
     let mut queue: Vec<Job> = Vec::new();
     loop {
@@ -209,17 +213,17 @@ fn worker(rx: mpsc::Receiver<Job>, tx: mpsc::Sender<Done>, ctx: egui::Context) {
                 let dark = key.1;
                 let renderer = renderers[dark as usize].get_or_insert_with(|| {
                     let theme = if dark { "dark" } else { "default" };
-                    HeadlessRenderer::new()
-                        .with_site_config(merman::MermaidConfig::from_value(serde_json::json!({ "theme": theme })))
+                    // Mermaid 12's "neo" look strokes shapes with a gradient, which leaves out
+                    // straight lines such as the compartment lines of class diagrams.
+                    let config = MermaidConfig::from_value(serde_json::json!({ "theme": theme, "look": "classic" }));
+                    Renderer::new().with_engine(Engine::new().with_site_config(config))
                 });
                 let fonts = fonts.get_or_insert_with(Fonts::load);
-                let result = match renderer.render_svg_resvg_safe_sync(&source) {
-                    Ok(Some(svg)) => fonts
-                        .parse(&without_background(&svg))
-                        .map(Arc::new)
-                        .map_err(|e| format!("cannot read the SVG: {e}")),
+                let result = match lay_out(renderer, &source) {
+                    Ok(Some(svg)) => fonts.parse(&svg).map(Arc::new).map_err(|e| format!("cannot read the SVG: {e}")),
                     Ok(None) => Err("not a Mermaid diagram".into()),
-                    Err(e) => Err(error_text(&e.to_string())),
+                    Err(RenderError::Cancelled(_)) => Err("it took too long to lay out".into()),
+                    Err(e) => Err(e.to_string().lines().next().unwrap_or_default().to_owned()),
                 };
                 log::debug!("laid out a Mermaid diagram in {:.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
                 Done::Layout { key, result }
@@ -233,26 +237,20 @@ fn worker(rx: mpsc::Receiver<Job>, tx: mpsc::Sender<Done>, ctx: egui::Context) {
     }
 }
 
-/// The SVG without the white background its root element asks for, so a diagram sits on
-/// the page in either theme.
-fn without_background(svg: &str) -> std::borrow::Cow<'_, str> {
-    let root = &svg[..svg.find('>').unwrap_or(0)];
-    let Some(start) = root.find("background-color:") else { return svg.into() };
-    let end = root[start..].find([';', '"']).map_or(root.len(), |i| start + i);
-    let end = if svg[end..].starts_with(';') { end + 1 } else { end };
-    format!("{}{}", &svg[..start], &svg[end..]).into()
-}
-
-/// One line of merman's error message, without the parser's debug dump around it.
-fn error_text(err: &str) -> String {
-    let line = err.lines().next().unwrap_or(err);
-    // "Diagram parse error (flowchart-v2): User { error: LexError { message: \"…\" } }"
-    if let (Some((head, _)), Some((_, msg))) = (line.split_once(": "), line.split_once("message: \"")) {
-        if let Some((msg, _)) = msg.rsplit_once('"') {
-            return format!("{head}: {}", msg.replace("\\\"", "\""));
-        }
+/// The diagram as SVG that usvg can draw: labels as SVG text rather than HTML, and no
+/// background, so that it sits on the page in either theme.
+fn lay_out(renderer: &Renderer, source: &str) -> Result<Option<String>, RenderError> {
+    let request = SvgRequest {
+        pipeline: Some(SvgPipeline::resvg_safe().with_postprocessor(RootBackgroundPostprocessor::new("transparent"))),
+        ..Default::default()
+    };
+    let control = OperationControl::new().with_deadline(LAYOUT_DEADLINE);
+    match renderer.render(RenderRequest::svg(source, control, request))? {
+        // Class, state and ER diagrams put each label in an <svg> of the width merman measured,
+        // which can be less than the font draws, and that <svg> would cut the text off.
+        RenderOutput::Svg(Some(svg)) => Ok(Some(svg.svg().replace(r#"style="overflow:hidden;"#, r#"style="overflow:visible;"#))),
+        _ => Ok(None),
     }
-    line.to_owned()
 }
 
 fn rasterize(tree: &usvg::Tree, [w, h]: [usize; 2]) -> ColorImage {
@@ -394,29 +392,5 @@ mod tests {
         assert!(!is_mermaid(Some("mermaidx")));
         assert!(!is_mermaid(Some("rust")));
         assert!(!is_mermaid(None));
-    }
-
-    #[test]
-    fn root_background_is_removed() {
-        let svg = r#"<svg style="max-width:20px;background-color:white" viewBox="0 0 20 10"><style>.a{background-color:red}</style></svg>"#;
-        assert_eq!(without_background(svg), r#"<svg style="max-width:20px;" viewBox="0 0 20 10"><style>.a{background-color:red}</style></svg>"#);
-        let svg = r#"<svg style="background-color:white;max-width:20px">"#;
-        assert_eq!(without_background(svg), r#"<svg style="max-width:20px">"#);
-        let svg = r#"<svg viewBox="0 0 1 1"><style>.a{background-color:red}</style></svg>"#;
-        assert_eq!(without_background(svg), svg);
-    }
-
-    #[test]
-    fn parser_errors_are_shortened() {
-        assert_eq!(
-            error_text(
-                "Diagram parse error (flowchart-v2): User { error: LexError { message: \"Unterminated node label (missing `]`)\" } }"
-            ),
-            "Diagram parse error (flowchart-v2): Unterminated node label (missing `]`)"
-        );
-        assert_eq!(
-            error_text("No diagram type detected matching given configuration for text: notADiagram\n foo"),
-            "No diagram type detected matching given configuration for text: notADiagram"
-        );
     }
 }
