@@ -115,9 +115,10 @@ mdread --light file.md                # force a theme for this session
 ```
 
 Open the file dialog with `Ctrl+O` (`⌘O` on macOS; uses zenity on Linux, the
-standard Open dialog on Windows) or drop a file onto the window. On Windows a
-dropped folder opens its README.md or index.md (else its first Markdown file),
-and a dropped shortcut opens its target.
+standard Open dialog on Windows) or drop a file onto the window. A folder,
+dropped or given on the command line, opens its README.md or index.md (else its
+first Markdown file). On Windows a shortcut (`.lnk`), dropped or given on the
+command line, opens its target.
 
 Files may be UTF-8 or, with a byte order mark, UTF-16; anything else is read
 in the system ANSI code page on Windows and as Windows-1252 elsewhere, and the
