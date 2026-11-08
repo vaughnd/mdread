@@ -348,7 +348,7 @@ pub fn shortcut_target(lnk: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-fn create_shortcut(lnk: &Path, target: &Path) -> bool {
+pub(crate) fn create_shortcut(lnk: &Path, target: &Path) -> bool {
     type SetPath = unsafe extern "system" fn(*mut c_void, *const u16) -> i32;
     type Save = unsafe extern "system" fn(*mut c_void, *const u16, i32) -> i32;
     let Some(link) = shell_link() else { return false };

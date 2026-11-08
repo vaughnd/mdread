@@ -401,6 +401,10 @@ impl App {
             title_bar_dark: None,
         };
 
+        // `--find` and the anchor belong to the document they were given with: both are
+        // applied only after a successful load. With no file and no stdin, `--find` still
+        // opens the search box.
+        let mut loaded = false;
         if args.stdin {
             use std::io::Read;
             app.stdin_mode = true;
@@ -412,21 +416,65 @@ impl App {
                     if let Some(enc) = decoded.encoding {
                         app.set_status(format!("Decoded as {enc}"));
                     }
+                    loaded = true;
                 }
                 Ok(_) => app.error = Some("No input on stdin".into()),
                 Err(e) => app.error = Some(format!("Cannot read stdin: {e}")),
             }
         } else if let Some(p) = args.files.first() {
-            if app.load_path(p.clone(), true, ctx) {
+            loaded = app.open_command_line_path(p.clone(), ctx);
+            if loaded {
                 app.pending_anchor = args.anchor.clone();
             }
         }
-        if let Some(q) = &args.find {
-            app.search.open = true;
-            app.search.query = q.clone();
-            app.search.focus_pending = true;
+        // With no file and no stdin there is nothing to load, and `--find` still opens the box.
+        if loaded || (args.files.is_empty() && !args.stdin) {
+            if let Some(q) = &args.find {
+                app.search.open = true;
+                app.search.query = q.clone();
+                app.search.focus_pending = true;
+            }
         }
         app
+    }
+
+    /// Opens the file named on the command line; returns whether a document was loaded.
+    /// A plain file costs one read, as before: the `.lnk` check is a string compare and a
+    /// folder is looked for only after the read failed. On Windows a shortcut opens its
+    /// target; a folder opens its README or first Markdown file.
+    fn open_command_line_path(&mut self, path: PathBuf, ctx: &Context) -> bool {
+        #[cfg(windows)]
+        let path = {
+            let mut path = path;
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
+                let _com = crate::win::ComApartment::init();
+                match crate::win::shortcut_target(&path) {
+                    Some(target) => path = target,
+                    None => {
+                        self.set_status(format!("{} does not point to a file", links::display_path(&path)));
+                        return false;
+                    }
+                }
+            }
+            path
+        };
+        if self.load_path(path.clone(), true, ctx) {
+            return true;
+        }
+        if !path.is_dir() {
+            return false;
+        }
+        match markdown_in_folder(&path) {
+            Some(file) => self.load_path(file, true, ctx),
+            None => {
+                // The failed read above left "Cannot read <folder>: Access is denied" on the
+                // screen, which misleads: replace it, as "No input on stdin" does.
+                let msg = format!("No Markdown files in {}", links::display_path(&path));
+                self.set_status(msg.clone());
+                self.error = Some(msg);
+                false
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -672,9 +720,9 @@ impl App {
         self.dialog_rx = Some(rx);
     }
 
-    /// Opens a file dropped on the window. On Windows a dropped shortcut opens its target,
-    /// and a dropped folder its README or first Markdown file: reading a folder as a file
-    /// fails there with a puzzling "Access is denied".
+    /// Opens a file dropped on the window. A dropped folder opens its README or first
+    /// Markdown file (reading a folder as a file fails on Windows with a puzzling "Access
+    /// is denied"), and on Windows a dropped shortcut opens its target.
     fn open_dropped(&mut self, path: PathBuf, ctx: &Context) {
         #[cfg(windows)]
         let path = {
@@ -689,15 +737,17 @@ impl App {
                     }
                 }
             }
-            if path.is_dir() {
-                match markdown_in_folder(&path) {
-                    Some(file) => path = file,
-                    None => {
-                        self.set_status(format!("No Markdown files in {}", links::display_path(&path)));
-                        return;
-                    }
+            path
+        };
+        let path = if path.is_dir() {
+            match markdown_in_folder(&path) {
+                Some(file) => file,
+                None => {
+                    self.set_status(format!("No Markdown files in {}", links::display_path(&path)));
+                    return;
                 }
             }
+        } else {
             path
         };
         self.load_path(path, true, ctx);
@@ -2228,8 +2278,8 @@ fn key_commands(i: &mut egui::InputState, typing: bool) -> Vec<Cmd> {
 }
 
 /// The file a dropped folder opens: its README or index, else the first Markdown file
-/// by name. Only this folder is looked at, as the drop is handled on the UI thread.
-#[cfg(windows)]
+/// by name. Only this folder is looked at, as the drop and the command line are handled
+/// on the UI thread.
 fn markdown_in_folder(dir: &Path) -> Option<PathBuf> {
     if let Some(p) = FOLDER_INDEX.iter().map(|n| dir.join(n)).find(|p| p.is_file()) {
         return Some(p);
@@ -2565,7 +2615,6 @@ mod tests {
         assert_eq!(key(CTRL, Key::End), [Cmd::Bottom]);
     }
 
-    #[cfg(windows)]
     #[test]
     fn dropped_folder_opens_its_readme_or_first_markdown_file() {
         let dir = std::env::temp_dir().join(format!("mdread-drop-test-{}", std::process::id()));
@@ -2690,6 +2739,105 @@ mod tests {
         assert!(app.status.as_ref().is_some_and(|(s, _)| s.starts_with("Cannot read ")), "{:?}", app.status);
         assert_eq!(app.pending_anchor, None);
         drop(_hold);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh temp folder for the command-line tests.
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let dir = dunce::canonicalize(std::env::temp_dir()).unwrap().join(format!("mdread-{tag}-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn app_with_args(args: Args) -> App {
+        App::new(&eframe::CreationContext::_new_kittest(Context::default()), args)
+    }
+
+    #[test]
+    fn command_line_folder_opens_its_readme() {
+        let dir = fresh_dir("cli-folder");
+        std::fs::write(dir.join("README.md"), "# Hello\n").unwrap();
+        let app = app_with_args(Args { files: vec![dir.clone()], ..Args::default() });
+        assert!(app.doc.is_some());
+        assert!(app.path.as_ref().is_some_and(|p| p.ends_with("README.md")), "{:?}", app.path);
+        assert!(app.error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_line_empty_folder_sets_a_status() {
+        let dir = fresh_dir("cli-empty");
+        let app = app_with_args(Args { files: vec![dir.clone()], ..Args::default() });
+        assert!(app.doc.is_none());
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.starts_with("No Markdown files in")), "{:?}", app.status);
+        assert!(app.error.as_ref().is_some_and(|e| e.starts_with("No Markdown files in")), "{:?}", app.error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_without_a_file_still_opens_search() {
+        let app = app_with_args(Args { find: Some("x".into()), ..Args::default() });
+        assert!(app.doc.is_none());
+        assert!(app.search.open);
+        assert_eq!(app.search.query, "x");
+    }
+
+    #[test]
+    fn find_is_not_applied_after_a_failed_load() {
+        let dir = fresh_dir("find-failed");
+        let app = app_with_args(Args { files: vec![dir.join("missing.md")], find: Some("x".into()), ..Args::default() });
+        assert!(app.doc.is_none());
+        assert!(!app.search.open);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_is_applied_after_a_successful_load() {
+        let dir = fresh_dir("find-ok");
+        let a = dir.join("a.md");
+        std::fs::write(&a, "# A\n").unwrap();
+        let app = app_with_args(Args { files: vec![a], find: Some("x".into()), ..Args::default() });
+        assert!(app.doc.is_some());
+        assert!(app.search.open);
+        assert_eq!(app.search.query, "x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn anchor_follows_the_folder_readme() {
+        let dir = fresh_dir("cli-folder-anchor");
+        std::fs::write(dir.join("README.md"), "# Top\n\n## x\n").unwrap();
+        let app = app_with_args(Args { files: vec![dir.clone()], anchor: Some("x".into()), ..Args::default() });
+        assert!(app.doc.is_some());
+        assert_eq!(app.pending_anchor.as_deref(), Some("x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_line_lnk_opens_its_target() {
+        let _com = crate::win::ComApartment::init();
+        let dir = fresh_dir("cli-lnk");
+        let target = dir.join("notes.md");
+        std::fs::write(&target, "# Notes\n").unwrap();
+        let lnk = dir.join("notes.md.lnk");
+        assert!(crate::win::create_shortcut(&lnk, &target));
+        let app = app_with_args(Args { files: vec![lnk], ..Args::default() });
+        assert!(app.doc.is_some());
+        assert_eq!(app.path, Some(target));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_line_bogus_lnk_sets_a_status() {
+        let dir = fresh_dir("cli-bad-lnk");
+        let lnk = dir.join("bogus.lnk");
+        std::fs::write(&lnk, "not a shortcut").unwrap();
+        let app = app_with_args(Args { files: vec![lnk], ..Args::default() });
+        assert!(app.doc.is_none());
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.ends_with("does not point to a file")), "{:?}", app.status);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
