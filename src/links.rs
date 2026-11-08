@@ -262,6 +262,103 @@ pub fn display_path(p: &Path) -> String {
     s
 }
 
+/// Whether a path received from another mdread (over the single-instance pipe) may be
+/// opened: a drive path, a UNC path, their `\\?\` forms or `\\?\Volume{...}`. Refused:
+/// `\\.\` device paths, `\\?\GLOBALROOT`, any other `\\?\` form, relative and drive-relative
+/// paths, a UNC share that is a pipe or mailslot (`\\localhost\pipe\x` reaches a local
+/// pipe over the SMB loopback; `IPC$` is the same door), and a reserved DOS device name as
+/// the last component. Unlike [`network_allowed`] this lets any share through, because the
+/// path comes from a double-click, not from a link in a document.
+///
+/// Pure and string based, so it judges the same on every OS and touches no file system
+/// (`Path::components` only knows Windows prefixes on Windows). `/` is read as `\`, so a
+/// slash form is judged exactly like its backslash form. The path goes through
+/// `to_string_lossy` on purpose: an unpaired surrogate becomes U+FFFD, which is not ASCII
+/// and so can neither form a refused name nor hide one, and the caller opens the original
+/// path, never this string. Everything unrecognised is refused. Never panics: all slicing
+/// goes through `get` or `split_once`.
+///
+/// Refusing reserved names inside `\\?\` paths, where such a name is a real file, is
+/// deliberate (fail closed). Windows 11 no longer maps `NUL.md` or `aux.md` in a folder to
+/// the device, but the rule stays for older systems.
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows single-instance code receives paths
+pub fn is_openable_local_path(p: &Path) -> bool {
+    let s = p.as_os_str().to_string_lossy().replace('/', "\\");
+    if s.contains('\0') {
+        return false;
+    }
+    let rest = if let Some(v) = s.strip_prefix(r"\\") {
+        match v.strip_prefix("?\\") {
+            Some(verbatim) => {
+                if let Some(unc) = strip_prefix_ci(verbatim, "UNC\\") {
+                    unc_after_share(unc)
+                } else if let Some(vol) = strip_prefix_ci(verbatim, "Volume{") {
+                    // `\\?\Volume{guid}\...`; without the backslash it is the raw volume device.
+                    vol.split_once('\\').and_then(|(guid, rest)| guid.ends_with('}').then_some(rest))
+                } else {
+                    disk_rest(verbatim)
+                }
+            }
+            // `\\.\` is a device namespace, `\\.` and `\\?` alone are no better.
+            None => unc_after_share(v),
+        }
+    } else {
+        disk_rest(&s)
+    };
+    // After `\\?\`, `GLOBALROOT`, `Device`, `pipe` and the like fail in `disk_rest`; `\\.\`
+    // and `\\?` alone fail on the server name in `unc_after_share`.
+    // Win32 folds `.` and `..` away by name before it opens anything, so the last component
+    // of such a path (`C:\x\nul\.`, `C:\x\nul\x\..`) is not the one opened. A double-clicked
+    // path never has such a segment, so any of them refuses the path (defensive: on older
+    // Windows the folded name could be a device).
+    let dot_segment = |c: &str| matches!(c.trim_end_matches(' '), "." | "..");
+    rest.is_some_and(|rest| !rest.split('\\').any(dot_segment) && !rest.rsplit('\\').find(|c| !c.is_empty()).is_some_and(is_dos_device_name))
+}
+
+/// `s` without `prefix`, comparing ASCII case-insensitively; `None` if `s` does not start
+/// with it (or the cut would fall inside a multi-byte character).
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = s.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix).then(|| &s[prefix.len()..])
+}
+
+/// For `X:\rest` the part after `X:\`; `None` for anything else, including `X:rest`
+/// (relative to the current folder on that drive) and `X:` alone.
+fn disk_rest(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\').then(|| &s[3..])
+}
+
+/// For `server\share\rest` the part after the share; `None` if the server or share is
+/// missing or odd, or the share is a pipe, mailslot or `IPC$`. Repeated backslashes
+/// between server and share are skipped, and trailing dots and spaces of the share are
+/// ignored when comparing. That last part is a defensive extra refusal (`pipe.` and
+/// `pipe ` are not known to reach the pipe share), not Windows behaviour.
+fn unc_after_share(unc: &str) -> Option<&str> {
+    let (server, tail) = unc.split_once('\\')?;
+    if server.is_empty() || server.chars().all(|c| matches!(c, '.' | '?')) {
+        return None;
+    }
+    let tail = tail.trim_start_matches('\\');
+    let (share, rest) = tail.split_once('\\').unwrap_or((tail, ""));
+    let share = share.trim_end_matches(['.', ' ']);
+    let refused = ["pipe", "mailslot", "ipc$"].iter().any(|n| share.eq_ignore_ascii_case(n));
+    (!share.is_empty() && !refused).then_some(rest)
+}
+
+/// Windows opens a file whose name is one of these (any extension, trailing dots and
+/// spaces ignored, `CON.txt`, `nul .md`, `nul:stream`) as the device, in any folder.
+/// Also `CONIN$`/`CONOUT$` and the superscript digits Windows 11 counts as COM/LPT numbers.
+fn is_dos_device_name(component: &str) -> bool {
+    let stem = component.trim_end_matches(['.', ' ']).split(['.', ':']).next().unwrap_or("").trim_end_matches(' ');
+    let up = stem.to_ascii_uppercase();
+    if matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") {
+        return true;
+    }
+    let number = up.strip_prefix("COM").or_else(|| up.strip_prefix("LPT"));
+    number.is_some_and(|d| matches!(d, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "\u{b9}" | "\u{b2}" | "\u{b3}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +410,170 @@ mod tests {
         let t = classify_link("https://example.org/a#b", None);
         assert_eq!(t, Some(Target::External("https://example.org/a#b".into())));
         assert_eq!(classify_link("mailto:a@b.c", None), Some(Target::External("mailto:a@b.c".into())));
+    }
+
+    // String based, so these run on every OS.
+    #[test]
+    fn openable_paths_are_drive_unc_and_their_verbatim_forms() {
+        for p in [
+            r"C:\x\a.md",
+            r"c:\x\a.md",
+            r"C:/x/a.md",
+            r"C:\x\COM10.md",
+            r"C:\x\console.md",
+            r"C:\x\nullable.md",
+            r"C:\x\aux2.md",
+            r"C:\x\.nul",
+            r"C:\x\a.md.",
+            r"C:\x\folder with spaces\a b.md",
+            r"C:\x\\a.md",
+            r"\\srv\share\a.md",
+            r"//srv/share/a.md",
+            r"\\srv\share",
+            r"\\wsl.localhost\Ubuntu\home\u\a.md",
+            r"\\srv\pipes\a.md",
+            r"\\?\C:\x\a.md",
+            r"\\?\c:\x\a.md",
+            r"//?/C:/x/a.md",
+            r"\\?\UNC\srv\share\a.md",
+            r"\\?\unc\srv\share\a.md",
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\a.md",
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\",
+            r"//?/Volume{12345678-1234-1234-1234-123456789abc}/a.md",
+            r"//?/Volume{12345678-1234-1234-1234-123456789abc}/",
+            r"\\?\volume{12345678-1234-1234-1234-123456789abc}\a.md",
+        ] {
+            assert!(is_openable_local_path(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn device_pipe_and_mailslot_paths_are_not_openable() {
+        for p in [
+            r"\\.\pipe\x",
+            r"//./pipe/x",
+            r"\\.\C:\x\a.md",
+            r"\\.\PhysicalDrive0",
+            r"\\.",
+            r"\\?\GLOBALROOT\Device\x",
+            r"\\?\globalroot\device\x",
+            r"//?/GLOBALROOT/x",
+            r"\\?\GLOBALROOT",
+            r"\\localhost\pipe\x",
+            r"\\LOCALHOST\PIPE\x",
+            r"\\127.0.0.1\Pipe\x",
+            r"\\?\UNC\localhost\pipe\x",
+            r"\\?\unc\localhost\PIPE\x",
+            r"//?/UNC/localhost/pipe/x",
+            r"\\srv\MAILSLOT\x",
+            r"\\srv\mailslot",
+            r"\\srv\\mailslot\x",
+            r"\\srv\pipe.\x",
+            r"\\srv\pipe \x",
+            r"\\srv\IPC$\x",
+            r"\\?\pipe\x",
+            // No backslash after `}`: the raw volume device.
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}",
+            r"//?/Volume{12345678-1234-1234-1234-123456789abc}",
+            r"\\?\Device\HarddiskVolume1\a.md",
+            r"\\??\C:\a.md",
+        ] {
+            assert!(!is_openable_local_path(Path::new(p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn reserved_dos_device_names_are_not_openable_as_the_last_component() {
+        for p in [
+            r"C:\x\aux.md",
+            r"C:\x\AUX",
+            r"C:\x\con . ",
+            r"C:\x\con.",
+            r"C:\x\con ",
+            r"C:\x\NUL.md",
+            r"C:\x\nul",
+            r"C:\x\Prn.tar.gz",
+            r"C:\x\COM1.md",
+            r"C:\x\com9",
+            r"C:\x\LPT1",
+            r"C:\x\LPT9.txt",
+            r"C:\x\nul .txt",
+            r"C:\x\nul:stream",
+            r"C:\x\CONIN$",
+            r"C:\x\conout$",
+            r"C:\x\COM\u{b9}.md",
+            r"C:\x\nul\",
+            r"C:\nul",
+            // A `.` or `..` is folded away by name by Win32, so the last component is not the one opened.
+            r"C:\x\nul\.",
+            r"C:\x\nul\x\..",
+            r"C:\x\nul\x\..\.",
+            r"C:\x\nul. .\.",
+            r"C:/x/nul/.",
+            r"C:\x\..",
+            r"C:\x\. \a.md",
+            r"\\srv\share\nul\.",
+            r"\\?\C:\x\nul\.",
+            r"\\srv\share\x\NUL.md",
+            r"\\?\C:\x\aux.md",
+            r"\\?\UNC\srv\share\x\com2.md",
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\LPT3.md",
+        ] {
+            // The `\u{b9}` row is written as a Rust escape, not as a raw string.
+            let p = p.replace(r"\u{b9}", "\u{b9}");
+            assert!(!is_openable_local_path(Path::new(&p)), "{p}");
+        }
+    }
+
+    #[test]
+    fn openable_forward_slashes_are_judged_like_backslashes() {
+        for (slash, back) in [
+            ("C:/x/a.md", r"C:\x\a.md"),
+            ("//srv/share/a.md", r"\\srv\share\a.md"),
+            ("//./pipe/x", r"\\.\pipe\x"),
+            ("//?/GLOBALROOT/x", r"\\?\GLOBALROOT\x"),
+            ("//localhost/pipe/x", r"\\localhost\pipe\x"),
+            ("C:/x/nul", r"C:\x\nul"),
+            ("C:/x/COM10.md", r"C:\x\COM10.md"),
+            ("//?/UNC/srv/share/a.md", r"\\?\UNC\srv\share\a.md"),
+            ("//?/Volume{1}/a.md", r"\\?\Volume{1}\a.md"),
+        ] {
+            assert_eq!(is_openable_local_path(Path::new(slash)), is_openable_local_path(Path::new(back)), "{slash}");
+        }
+    }
+
+    #[test]
+    fn unrecognised_and_degenerate_paths_are_not_openable_and_never_panic() {
+        for p in [
+            "", r"\", r"\\", r"\\\", r"\\\\", r"\\?\", r"\\?\UNC", r"\\?\UNC\", r"\\?\UNC\srv", r"\\?\UNC\\\", r"\\?\C:", r"\\?\Volume{",
+            r"\\srv", r"\\srv\", "C:", r"C:x", r"C:\nul\", "a.md", r"x\a.md", r"..\a.md", r"\x\a.md", "/x/a.md", "\u{e9}", "\\\\?\\\u{e9}",
+            "\\\\?\\UN\u{e9}\\a", "C\u{e9}:\\a", "\0", "C:\\x\\\0",
+        ] {
+            assert!(!is_openable_local_path(Path::new(p)), "{p:?}");
+        }
+        // Every prefix of an accepted and a refused path: no panic, whatever the answer.
+        for full in ["\\\\?\\UNC\\srv\\share\\x\\a\u{e9}.md", "\\\\?\\Volume{1}\\\u{e9}\\COM\u{b9}", "C:\\\u{e9}\\con . "] {
+            for end in 0..=full.len() {
+                if let Some(head) = full.get(..end) {
+                    let _ = is_openable_local_path(Path::new(head));
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn openable_filter_survives_unpaired_surrogates() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        let wide = |s: &str, lone: u16| {
+            let mut v: Vec<u16> = s.encode_utf16().collect();
+            v.push(lone);
+            PathBuf::from(OsString::from_wide(&v))
+        };
+        assert!(is_openable_local_path(&wide(r"C:\x\a", 0xD800)));
+        assert!(!is_openable_local_path(&wide(r"\\.\pipe\", 0xDC00)));
+        assert!(!is_openable_local_path(&PathBuf::from(OsString::from_wide(&[0xD800]))));
     }
 
     #[cfg(windows)]

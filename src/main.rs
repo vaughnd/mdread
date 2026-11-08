@@ -7,6 +7,8 @@ mod document;
 mod files;
 mod fonts;
 mod highlight;
+#[cfg(windows)]
+mod instance;
 mod links;
 mod mermaid;
 mod render;
@@ -21,7 +23,7 @@ mod win;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-use app::{Args, ThemeChoice};
+use app::{Args, ThemeChoice, WindowChoice};
 
 const HELP: &str = "\
 mdread — fast Markdown viewer
@@ -34,6 +36,9 @@ OPTIONS:
     --dark, --light      Force a theme for this session
     --system             Follow the system theme for this session (the default
                          until a theme is picked in mdread)
+    --new-window         Open a new window even when files open in the open one (Windows)
+    --same-window        Open the file in the open mdread window, if there is one (Windows)
+                         If both are given, the last one wins.
     --find TERM          Open with the search box filled in
     --screenshot PATH    Save a PNG of the window and exit, once diagrams, images
                          and highlighting are done and at least 1.5 s have passed
@@ -95,6 +100,9 @@ fn parse_args_from(argv: impl IntoIterator<Item = OsString>, exists: impl Fn(&Pa
             "--dark" => args.theme = Some(ThemeChoice::Dark),
             "--light" => args.theme = Some(ThemeChoice::Light),
             "--system" => args.theme = Some(ThemeChoice::System),
+            // Like `--dark --light`, one Option, so the last one given wins.
+            "--new-window" => args.window = Some(WindowChoice::NewWindow),
+            "--same-window" => args.window = Some(WindowChoice::SameWindow),
             "-" => args.stdin = true,
             _ if s.starts_with("--") => exit_with(&format!("unknown option {s}\n{HELP}\n"), 2),
             _ => {
@@ -212,7 +220,15 @@ fn main() -> eframe::Result {
     win::install_panic_hook();
     init_logging();
     let mut args = parse_args();
+    // `launched` is also the start of the single-window sender's 10 s deadline (`claim_or_forward`).
     args.launched = Some(launched);
+
+    // Before any window: forward the file to the receiving window, or claim the pipe and become it. The setting is
+    // read here (after `init_logging`, so its timing reaches the log) and only by the launches that need it.
+    #[cfg(windows)]
+    if instance::claim_or_forward(&args, instance::launch_mode(&args, instance::read_setting)) == instance::Claim::Forwarded {
+        std::process::exit(0);
+    }
 
     #[cfg(not(windows))]
     let result = run(native_options(), args);
@@ -220,6 +236,8 @@ fn main() -> eframe::Result {
     let result = run_windows(args);
     #[cfg(windows)]
     if let Err(e) = &result {
+        // Free the pipe first: the error box blocks, and senders would wait out their deadline on it.
+        instance::shutdown();
         win::report_fatal(&format!("mdread stopped with an error:\n{e}"), &format!("run_native failed: {e:?}"));
     }
     result
@@ -265,6 +283,26 @@ mod tests {
         assert_eq!(args.files, [PathBuf::from("a.md"), PathBuf::from("b.md")]);
         assert_eq!(args.anchor, None);
         assert_eq!(parse(&["a.md#x", "b.md#y"], &both).anchor, Some("x".into()));
+    }
+
+    #[test]
+    fn window_flags_last_one_wins() {
+        assert_eq!(parse(&["--same-window", "--new-window", "a.md"], &[]).window, Some(WindowChoice::NewWindow));
+        assert_eq!(parse(&["--new-window", "--same-window", "a.md"], &[]).window, Some(WindowChoice::SameWindow));
+        assert_eq!(parse(&["a.md"], &[]).window, None);
+    }
+
+    #[test]
+    fn window_flags_do_not_take_a_value_or_a_file() {
+        let args = parse(&["--same-window", "a.md"], &[]);
+        assert_eq!(args.files, [PathBuf::from("a.md")]);
+        assert_eq!(args.window, Some(WindowChoice::SameWindow));
+        assert_eq!(parse(&["--new-window", "a.md"], &[]).files, [PathBuf::from("a.md")]);
+    }
+
+    #[test]
+    fn help_says_the_last_window_flag_wins() {
+        assert!(HELP.contains("If both are given, the last one wins."));
     }
 
     #[test]

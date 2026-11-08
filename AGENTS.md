@@ -61,6 +61,8 @@ cargo clippy --release --all-targets   # main is clippy-clean; a new warning is 
   script fallbacks.
 - `src/files.rs`, `src/links.rs`, `src/search.rs`, `src/text.rs`, `src/theme.rs`,
   `src/svg_loader.rs`, `src/win.rs` (Windows only).
+- `src/instance.rs` and `src/instance/pipe.rs` (Windows only): single-window mode: the
+  launch table, the setting, and the named pipe that hands a file to the open window.
 - `PLAN.md`: follow-ups noted for later.
 
 ## Conventions

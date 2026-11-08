@@ -22,8 +22,8 @@ use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems, ShellLink};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, DefWindowProcW, MessageBoxW, SetWindowLongPtrW, SystemParametersInfoW, GWLP_WNDPROC, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
-    SPI_GETWORKAREA, WM_SETTINGCHANGE, WNDPROC,
+    CallWindowProcW, DefWindowProcW, GetLastActivePopup, IsHungAppWindow, IsIconic, MessageBoxW, SetForegroundWindow, SetWindowLongPtrW, ShowWindowAsync, SystemParametersInfoW,
+    GWLP_WNDPROC, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND, SPI_GETWORKAREA, SW_RESTORE, WM_SETTINGCHANGE, WNDPROC,
 };
 
 /// `MDREAD_RENDERER=glow|wgpu` (case-insensitive) forces a renderer and disables the
@@ -148,6 +148,9 @@ pub fn report_fatal(summary: &str, details: &str) {
 pub fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // First, before the relaunch below and before the crash box: free the single-window pipe, so the relaunched
+        // child can claim it and senders do not wait on a window that is gone.
+        crate::instance::shutdown();
         if disarm_renderer_fallback() && relaunch_with_wgpu() {
             if !cfg!(debug_assertions) {
                 append_crash_log(&format!("glow renderer failed to start, relaunched with wgpu: {info}"));
@@ -256,6 +259,32 @@ pub fn set_title_bar_dark(hwnd: isize, dark: bool) {
         WINIT_WNDPROC.store(prev, Ordering::Relaxed);
     }
     apply_title_bar(hwnd, dark);
+}
+
+/// Brings the window to the front for a forwarded file, so the user sees where it opened,
+/// from the pipe thread: eframe runs no frame while the window is minimised, so the
+/// UI thread could not do it. A minimised window is restored (a maximised one stays
+/// maximised); the foreground goes to its last active popup, so with the Open dialog up the
+/// dialog gets it. Nothing here waits for the UI thread: `ShowWindowAsync` posts, and
+/// `SetForegroundWindow` only changes the foreground (Windows may refuse and flash the
+/// taskbar button instead). `hwnd` is an integer so the closure holding it is `Send`.
+pub fn bring_to_front(hwnd: isize) {
+    let hwnd = hwnd as HWND;
+    // SAFETY: plain calls on a window handle; a stale handle only makes them fail.
+    unsafe {
+        if IsIconic(hwnd) != 0 {
+            ShowWindowAsync(hwnd, SW_RESTORE);
+        }
+        let popup = GetLastActivePopup(hwnd);
+        SetForegroundWindow(if popup.is_null() { hwnd } else { popup });
+    }
+}
+
+/// Whether the window has not answered messages for a while (Windows' "Not responding").
+/// The receiving window refuses forwards then, so the sender opens its own window.
+pub fn is_hung(hwnd: isize) -> bool {
+    // SAFETY: a plain query on a window handle.
+    unsafe { IsHungAppWindow(hwnd as HWND) != 0 }
 }
 
 fn apply_title_bar(hwnd: HWND, dark: bool) {

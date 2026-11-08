@@ -3,7 +3,9 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -120,6 +122,20 @@ pub struct Args {
     pub anchor: Option<String>,
     /// `--find TERM`: open with the search box filled in.
     pub find: Option<String>,
+    /// `--new-window` / `--same-window`, whichever came last. Only the single-instance
+    /// code on Windows reads it; the flags are accepted everywhere so scripts stay portable.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub window: Option<WindowChoice>,
+}
+
+/// Where a launch with a file wants to open, when it says so.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum WindowChoice {
+    /// `--new-window`: a window of its own even when the setting would send the file to the open one.
+    NewWindow,
+    /// `--same-window`: the open mdread window, if there is one.
+    SameWindow,
 }
 
 enum WatchEvent {
@@ -132,11 +148,23 @@ enum WatchEvent {
 }
 
 /// Size and modification time of the open file.
-type FileStamp = (u64, SystemTime);
+pub(crate) type FileStamp = (u64, SystemTime);
 
-fn file_stamp(path: &Path) -> Option<FileStamp> {
+pub(crate) fn file_stamp(path: &Path) -> Option<FileStamp> {
     let m = std::fs::metadata(path).ok()?;
     Some((m.len(), m.modified().ok()?))
+}
+
+/// Reads a document to open: the path it is shown under, and its decoded text with the
+/// file's stamp taken before the read (or the read error). dunce leaves out the `\\?\`
+/// prefix Windows puts on canonical paths. Some virtual drives cannot be canonicalized; an
+/// absolute path still gives the folder links and the sidebar start from, and it is what
+/// an error message names.
+fn read_for_open(path: &Path) -> (PathBuf, std::io::Result<(text::Decoded, Option<FileStamp>)>) {
+    let path = dunce::canonicalize(path).or_else(|_| std::path::absolute(path)).unwrap_or_else(|_| path.to_path_buf());
+    let stamp = file_stamp(&path);
+    let read = std::fs::read(&path).map(|bytes| (text::decode(bytes), stamp));
+    (path, read)
 }
 
 /// How often the open file's stamp is checked on Windows, as a fallback for the watcher.
@@ -270,6 +298,102 @@ pub struct App {
     /// Whether the title bar was last made dark (Windows; None before the first frame).
     #[cfg(windows)]
     title_bar_dark: Option<bool>,
+
+    /// The ticket of the last navigation on the UI thread (`load_path_in`, failed or not,
+    /// which `go_history` goes through, and the stdin load). A forward result committed
+    /// before it is dropped, so a slow forward never replaces what the user opened since.
+    /// Applying a forward does not change it: forwards apply in the order their results
+    /// reach the UI thread, each pushed on history, the last one shown (an Explorer
+    /// multi-select opens every file, not only the first to be read).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    nav_gen: u64,
+    /// Where tickets come from, shared with the pipe thread, which takes one when a request
+    /// is committed, so "committed before the last navigation" is one comparison.
+    open_tickets: Arc<AtomicU64>,
+    /// A forwarded file applied this frame, logged once the frame has drawn it.
+    #[cfg(windows)]
+    forward_shown: Option<(PathBuf, Instant)>,
+    /// Forward workers send their results here; `poll_channels` applies them.
+    #[cfg(windows)]
+    forward_tx: mpsc::Sender<crate::instance::ForwardResult>,
+    #[cfg(windows)]
+    forward_rx: mpsc::Receiver<crate::instance::ForwardResult>,
+    /// The window, as an integer so the pipe thread's closures can hold it; None without
+    /// a native window (the headless tests).
+    #[cfg(windows)]
+    hwnd: Option<isize>,
+    /// Started with `--same-window`: such a window keeps receiving when the setting is
+    /// turned off in it, since the user asked for this window explicitly.
+    #[cfg(windows)]
+    started_same_window: bool,
+    /// Started for stdin or `--screenshot`: never receives, not even when the setting is
+    /// turned on in it: its page is not a file, or it is about to exit.
+    #[cfg(windows)]
+    never_receives: bool,
+    /// The pipe this window serves, if it receives.
+    #[cfg(windows)]
+    server: Option<crate::instance::Server>,
+    /// A server stopped by turning the setting off whose thread had not finished within
+    /// `stop_serving`'s wait; kept so turning the setting on again can tell whether the
+    /// name is free yet.
+    #[cfg(windows)]
+    stopped_server: Option<crate::instance::Server>,
+    /// The help window's checkbox: the setting as read when the help window was opened (one
+    /// registry read per opening, not per frame), then as written by its clicks.
+    #[cfg(windows)]
+    setting_on: bool,
+    /// Tests: a test pipe name instead of this exe's, and a test registry key instead of
+    /// `Software\mdread`, so they never touch a real mdread's pipe or the real setting.
+    #[cfg(all(windows, test))]
+    pipe_name: Option<String>,
+    #[cfg(all(windows, test))]
+    setting_subkey: Option<String>,
+}
+
+/// At most this many forwarded files are read at once (each on its own worker thread). The
+/// cap is checked in `accept`, before the sender is told its file is delivered: a sender
+/// beyond it is refused, keeps its file and opens a window of its own, instead of more
+/// threads getting stuck on a slow share.
+#[cfg(windows)]
+const MAX_FORWARD_WORKERS: usize = 8;
+
+/// The receiver's `accept`: refuse while the window hangs (a file sent to it would wait
+/// unseen) or while every worker place is taken (the file would have no worker to read it).
+/// Only the pipe thread takes places, and it runs `accept` and `commit` back to back, so a
+/// place free here is still free in `commit`.
+#[cfg(windows)]
+fn accepts_forward(in_flight: &AtomicUsize, hung: bool) -> bool {
+    !hung && in_flight.load(Ordering::SeqCst) < MAX_FORWARD_WORKERS
+}
+
+/// One of the `MAX_FORWARD_WORKERS` places, held by a forward worker for as long as it runs
+/// and given back when dropped, also if the thread could not be started.
+#[cfg(windows)]
+struct WorkerSlot(Arc<AtomicUsize>);
+
+#[cfg(windows)]
+impl WorkerSlot {
+    /// A place, unless `max` are taken.
+    fn take(count: &Arc<AtomicUsize>, max: usize) -> Option<Self> {
+        // Taken first and given back when over, so two threads cannot both take the last place.
+        if count.fetch_add(1, Ordering::SeqCst) >= max {
+            count.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self(count.clone()))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The next open ticket. Never 0, so a new window's `nav_gen` of 0 makes no ticket stale.
+fn take_ticket(tickets: &AtomicU64) -> u64 {
+    tickets.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
 }
 
 /// What a folder link opens, in this order.
@@ -337,6 +461,16 @@ impl App {
         let pal = if dark { Palette::dark() } else { Palette::light() };
         theme::apply(ctx, &pal, &fonts, settings.base_size);
         let (launch_tx, launch_rx) = mpsc::channel();
+        #[cfg(windows)]
+        let (forward_tx, forward_rx) = mpsc::channel();
+        #[cfg(windows)]
+        let hwnd = {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            match cc.window_handle().map(|h| h.as_raw()) {
+                Ok(RawWindowHandle::Win32(w)) => Some(w.hwnd.get()),
+                _ => None,
+            }
+        };
 
         let mut app = Self {
             settings,
@@ -399,6 +533,30 @@ impl App {
             screenshot_unsettled: false,
             #[cfg(windows)]
             title_bar_dark: None,
+            nav_gen: 0,
+            open_tickets: Arc::new(AtomicU64::new(0)),
+            #[cfg(windows)]
+            forward_shown: None,
+            #[cfg(windows)]
+            forward_tx,
+            #[cfg(windows)]
+            forward_rx,
+            #[cfg(windows)]
+            hwnd,
+            #[cfg(windows)]
+            started_same_window: args.window == Some(WindowChoice::SameWindow),
+            #[cfg(windows)]
+            never_receives: args.stdin || args.screenshot.is_some(),
+            #[cfg(windows)]
+            server: None,
+            #[cfg(windows)]
+            stopped_server: None,
+            #[cfg(windows)]
+            setting_on: false,
+            #[cfg(all(windows, test))]
+            pipe_name: None,
+            #[cfg(all(windows, test))]
+            setting_subkey: None,
         };
 
         // `--find` and the anchor belong to the document they were given with: both are
@@ -407,6 +565,7 @@ impl App {
         let mut loaded = false;
         if args.stdin {
             use std::io::Read;
+            app.bump_nav_gen();
             app.stdin_mode = true;
             let mut bytes = Vec::new();
             match std::io::stdin().read_to_end(&mut bytes) {
@@ -435,7 +594,174 @@ impl App {
                 app.search.focus_pending = true;
             }
         }
+        // Serving starts after the window's own file is loaded, so a forward that arrives
+        // during startup gets a newer ticket and is shown, with the startup file on Back.
+        #[cfg(windows)]
+        if !args.stdin {
+            if app.hwnd.is_some() {
+                if let Some(pipe) = crate::instance::take_pending() {
+                    app.start_serving(pipe, ctx);
+                }
+            } else {
+                // No native window (never seen outside the headless tests): close a claimed
+                // pipe, so senders find no receiver instead of waiting for one that never
+                // answers. Not in tests, which must not take a pipe another test claimed.
+                #[cfg(not(test))]
+                if crate::instance::take_pending().is_some() {
+                    log::warn!("single-window mode: no window handle; not receiving");
+                }
+            }
+        }
         app
+    }
+
+    /// Serves the claimed pipe. Both closures run on the pipe thread and must return
+    /// quickly without waiting for the UI thread and without panicking: `accept` asks
+    /// Windows whether the window hangs and checks the worker cap (`accepts_forward`), and
+    /// `commit` takes the open ticket, restores and focuses the window, and hands the
+    /// request to a worker thread, which reads the file (off the UI thread, since a share
+    /// can take tens of seconds) and sends the result to `poll_channels`. Without a window
+    /// handle (only the headless tests serve so) there is no window to ask or to focus.
+    #[cfg(windows)]
+    fn start_serving(&mut self, pipe: crate::instance::PipeHandle, ctx: &Context) {
+        use crate::instance::{resolve_forward, ForwardResult, Request};
+        let hwnd = self.hwnd;
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let accept = {
+            let in_flight = in_flight.clone();
+            Arc::new(move |_: &Request| accepts_forward(&in_flight, hwnd.is_some_and(crate::win::is_hung)))
+        };
+        let tickets = self.open_tickets.clone();
+        let tx = self.forward_tx.clone();
+        let ctx = ctx.clone();
+        let commit = Arc::new(move |request: Request| {
+            let arrived = Instant::now();
+            let gen = take_ticket(&tickets);
+            if let Some(hwnd) = hwnd {
+                crate::win::bring_to_front(hwnd);
+            }
+            ctx.request_repaint();
+            // The sender has been told the file is delivered, so a file that gets no worker
+            // still gets a status instead of vanishing. `Sender::send` never blocks.
+            let fail = |request: Request, msg: String| {
+                log::warn!("forwarded {}: {msg}", request.path.display());
+                if tx.send(ForwardResult { gen, request, outcome: Err(msg), arrived }).is_ok() {
+                    ctx.request_repaint();
+                }
+            };
+            // `accept` refused at the cap already; this is only a safety net.
+            let Some(slot) = WorkerSlot::take(&in_flight, MAX_FORWARD_WORKERS) else {
+                fail(request, "Too many files are being opened at once".into());
+                return;
+            };
+            let (tx2, ctx2, fallback) = (tx.clone(), ctx.clone(), request.clone());
+            let worker = std::thread::Builder::new().name("forward-open".into()).spawn(move || {
+                let _slot = slot;
+                let outcome = resolve_forward(&request);
+                if tx2.send(ForwardResult { gen, request, outcome, arrived }).is_ok() {
+                    ctx2.request_repaint();
+                }
+            });
+            if worker.is_err() {
+                let msg = format!("Cannot open {}: no worker thread available", links::display_path(&fallback.path));
+                fail(fallback, msg);
+            }
+        });
+        self.server = Some(pipe.serve(accept, commit));
+    }
+
+    /// The help window's checkbox. The value is written at once, by this window only, never
+    /// from `app.ron` or on exit, so another window's save cannot undo it. On: this window
+    /// starts receiving if no window does. Off: this window stops receiving, unless it was
+    /// started with `--same-window`, which keeps listening (the user asked for it on the
+    /// command line); a receiver in another window keeps its pipe until it closes.
+    #[cfg(windows)]
+    fn set_single_window(&mut self, on: bool, ctx: &Context) {
+        if let Err(e) = self.write_setting(on) {
+            log::warn!("single-window setting: cannot write it ({e})");
+            self.set_status(format!("Cannot save the setting: {e}"));
+            return;
+        }
+        self.setting_on = on;
+        if on {
+            self.start_receiving(ctx);
+        } else if !self.started_same_window {
+            if let Some(server) = self.server.take() {
+                server.stop_serving();
+                log::info!("single-window mode turned off: no longer receiving");
+                if !server.is_finished() {
+                    self.stopped_server = Some(server);
+                }
+            }
+        }
+    }
+
+    /// Turning the setting on: claim the pipe exactly as `main` would, unless this window
+    /// never receives, already receives, or still waits for a server it stopped earlier.
+    /// A name another window holds means that window receives, and nothing more happens.
+    #[cfg(windows)]
+    fn start_receiving(&mut self, ctx: &Context) {
+        use crate::instance::CreateError;
+        // No native window: as in `App::new`, do not serve (never seen outside the tests).
+        #[cfg(not(test))]
+        if self.hwnd.is_none() {
+            log::warn!("single-window mode: no window handle; not receiving");
+            return;
+        }
+        if self.never_receives || self.server.as_ref().is_some_and(|s| !s.is_finished()) {
+            return;
+        }
+        if self.stopped_server.as_ref().is_some_and(|s| !s.is_finished()) {
+            self.set_status("Receiving starts with the next window");
+            return;
+        }
+        self.stopped_server = None;
+        self.server = None;
+        // Low integrity and AppContainer windows have no identity to serve with: a pipe at
+        // their level could be opened by other sandboxed processes.
+        let (id, name) = match crate::instance::own_identity().and_then(|id| Ok((id, self.receiving_pipe_name()?))) {
+            Ok(found) => found,
+            Err(e) => {
+                log::info!("single-window mode: not taking part ({e})");
+                return;
+            }
+        };
+        match crate::instance::create_pipe(&name, &id) {
+            Ok(pipe) => {
+                self.start_serving(pipe, ctx);
+                log::info!("single-window mode turned on: receiving");
+            }
+            Err(CreateError::Taken) => log::info!("single-window mode turned on: another window receives"),
+            Err(CreateError::Other(e)) => log::warn!("single-window pipe {name}: cannot create it ({e}); not receiving"),
+        }
+    }
+
+    /// The setting as stored in the registry, for the checkbox when the help window opens.
+    #[cfg(windows)]
+    fn read_setting(&self) -> bool {
+        #[cfg(test)]
+        if let Some(key) = &self.setting_subkey {
+            return crate::instance::read_setting_at(key);
+        }
+        crate::instance::read_setting()
+    }
+
+    #[cfg(windows)]
+    fn write_setting(&self, on: bool) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(key) = &self.setting_subkey {
+            return crate::instance::write_setting_at(key, on);
+        }
+        crate::instance::write_setting(on)
+    }
+
+    #[cfg(windows)]
+    fn receiving_pipe_name(&self) -> std::io::Result<String> {
+        #[cfg(test)]
+        if let Some(name) = &self.pipe_name {
+            return Ok(name.clone());
+        }
+        crate::instance::name_for_this_exe()
     }
 
     /// Opens the file named on the command line; returns whether a document was loaded.
@@ -520,34 +846,12 @@ impl App {
     /// Open `path` with the files sidebar showing `files_dir`, or a folder chosen by
     /// `files::sidebar_root` when that is `None`. Returns whether the file was read.
     fn load_path_in(&mut self, path: PathBuf, push_history: bool, files_dir: Option<PathBuf>, ctx: &Context) -> bool {
-        // dunce leaves out the `\\?\` prefix Windows puts on canonical paths. Some virtual
-        // drives cannot be canonicalized; an absolute path still gives the folder links
-        // and the sidebar start from.
-        let path = dunce::canonicalize(&path).or_else(|_| std::path::absolute(&path)).unwrap_or(path);
-        let stamp = file_stamp(&path);
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                let decoded = text::decode(bytes);
-                if push_history {
-                    self.save_visit();
-                    if !self.history.is_empty() {
-                        self.history.truncate(self.history_pos + 1);
-                    }
-                    self.history.push(Visit { path: path.clone(), offset: 0.0, files_dir: None });
-                    self.history_pos = self.history.len() - 1;
-                }
-                self.stdin_mode = false;
-                self.set_document(decoded.text, Some(path.clone()), ctx);
-                if let Some(enc) = decoded.encoding {
-                    self.set_status(format!("Decoded as {enc}"));
-                }
-                self.pending_offset = Some(0.0);
-                self.jump = None;
-                self.reload_retries = 0;
-                self.setup_watcher(&path, stamp, ctx);
-                let home = fonts::home_dir();
-                let dir = files_dir.or_else(|| files::sidebar_root(self.files_dir.as_deref(), &path, home.as_deref()));
-                self.set_files_dir(dir, ctx);
+        // A navigation, failed or not: a slow forward result must not replace what the user asked for since.
+        self.bump_nav_gen();
+        let (path, read) = read_for_open(&path);
+        match read {
+            Ok((decoded, stamp)) => {
+                self.finish_load(path, decoded, stamp, push_history, files_dir, ctx);
                 true
             }
             Err(e) => {
@@ -569,6 +873,90 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Shows a document that was read (by `load_path_in`, or by a forward worker): history,
+    /// title, watcher and sidebar. `stamp` is the file's stamp from before the read, so a
+    /// change made while it was read still counts as a change.
+    fn finish_load(&mut self, path: PathBuf, decoded: text::Decoded, stamp: Option<FileStamp>, push_history: bool, files_dir: Option<PathBuf>, ctx: &Context) {
+        if push_history {
+            self.save_visit();
+            if !self.history.is_empty() {
+                self.history.truncate(self.history_pos + 1);
+            }
+            self.history.push(Visit { path: path.clone(), offset: 0.0, files_dir: None });
+            self.history_pos = self.history.len() - 1;
+        }
+        self.stdin_mode = false;
+        self.set_document(decoded.text, Some(path.clone()), ctx);
+        if let Some(enc) = decoded.encoding {
+            self.set_status(format!("Decoded as {enc}"));
+        }
+        self.pending_offset = Some(0.0);
+        // Also the offset `save_visit` records if another open follows before a frame draws
+        // this one (several forwards applied in one frame).
+        self.scroll_offset = 0.0;
+        self.jump = None;
+        self.reload_retries = 0;
+        self.setup_watcher(&path, stamp, ctx);
+        let home = fonts::home_dir();
+        let dir = files_dir.or_else(|| files::sidebar_root(self.files_dir.as_deref(), &path, home.as_deref()));
+        self.set_files_dir(dir, ctx);
+    }
+
+    fn bump_nav_gen(&mut self) {
+        self.nav_gen = take_ticket(&self.open_tickets);
+    }
+
+    /// Shows what a forward worker read, as a new history entry. Dropped only if it was
+    /// committed before the last navigation on the UI thread; other forwards never make it
+    /// stale, so results apply in the order they reach the UI thread. The window was
+    /// already restored and focused on the pipe thread; that is not undone when the result
+    /// is dropped.
+    #[cfg(windows)]
+    fn apply_forward(&mut self, r: crate::instance::ForwardResult, ctx: &Context) {
+        if r.gen < self.nav_gen {
+            log::debug!("forwarded {}: dropped, something else was opened since", r.request.path.display());
+            return;
+        }
+        self.menu = None;
+        let opened = match r.outcome {
+            Ok(opened) => opened,
+            Err(msg) => {
+                log::info!("forwarded {}: {msg}", r.request.path.display());
+                if self.doc.is_some() {
+                    // A shown page stays, as for a failed Ctrl+O.
+                    self.set_status(msg);
+                } else {
+                    // The welcome or error screen: the error screen, for this request. `path`
+                    // is cleared so Ctrl+R does not retry an earlier file under this message.
+                    self.error = Some(msg);
+                    self.path = None;
+                    self.pending_anchor = None;
+                    ctx.send_viewport_cmd(ViewportCommand::Title("mdread".into()));
+                }
+                return;
+            }
+        };
+        let path = opened.path.clone();
+        if self.doc.is_some() && self.path.as_ref() == Some(&opened.path) {
+            // Already shown: no reload and no second history entry; the anchor jumps, or the
+            // scroll position stays.
+            if let Some(b) = r.request.anchor.as_deref().and_then(|a| self.doc.as_ref()?.find_slug(a)) {
+                self.jump_to_block(b);
+            }
+        } else {
+            self.finish_load(opened.path, opened.decoded, opened.stamp, true, None, ctx);
+            self.pending_anchor = r.request.anchor.clone();
+        }
+        if let Some(q) = r.request.find.as_ref().filter(|q| !q.is_empty()) {
+            self.search.open = true;
+            self.search.query = q.clone();
+            self.search.focus_pending = true;
+            // Run again even for the same query, so the view goes to the first match.
+            self.search.last_gen = 0;
+        }
+        self.forward_shown = Some((path, r.arrived));
     }
 
     fn reload(&mut self, ctx: &Context, announce: bool) {
@@ -785,6 +1173,7 @@ impl App {
         self.history_pos = (self.history_pos as isize + delta as isize) as usize;
         self.load_path_in(visit.path, false, visit.files_dir, ctx);
         self.pending_offset = Some(visit.offset);
+        self.scroll_offset = visit.offset;
     }
 
     /// Note where the current file was left, for coming back to it.
@@ -1246,7 +1635,15 @@ impl App {
                         self.set_column_width(self.settings.column_width + 60.0);
                     }
                 }
-                Cmd::Help => self.show_help = !self.show_help,
+                Cmd::Help => {
+                    self.show_help = !self.show_help;
+                    // Read once per opening, not per frame, so it shows a change made in
+                    // another window.
+                    #[cfg(windows)]
+                    if self.show_help {
+                        self.setting_on = self.read_setting();
+                    }
+                }
                 Cmd::ZoomReset => self.zoom_to(ctx, 1.0),
             }
         }
@@ -1288,6 +1685,10 @@ impl App {
         self.diagrams.poll();
         while let Ok(msg) = self.launch_rx.try_recv() {
             self.set_status(msg);
+        }
+        #[cfg(windows)]
+        while let Ok(r) = self.forward_rx.try_recv() {
+            self.apply_forward(r, ctx);
         }
         if let Some(rx) = &self.dialog_rx {
             match rx.try_recv() {
@@ -1716,6 +2117,9 @@ impl App {
         let pal = self.pal;
         let base = self.settings.base_size;
         let mut open = self.show_help;
+        // The checkbox's click, applied once the window is drawn.
+        #[cfg(windows)]
+        let mut clicked = None;
         egui::Window::new(RichText::new("Keyboard shortcuts").size(base * 1.1))
             .open(&mut open)
             .collapsible(false)
@@ -1758,12 +2162,24 @@ impl App {
                     }
                 });
                 ui.add_space(10.0);
+                #[cfg(windows)]
+                {
+                    let mut on = self.setting_on;
+                    if ui.checkbox(&mut on, RichText::new("Open files in the window that is already open").color(pal.text)).changed() {
+                        clicked = Some(on);
+                    }
+                    ui.add_space(6.0);
+                }
                 ui.label(
                     RichText::new(format!("Fonts: {} · {}", self.fonts.sans_name, self.fonts.mono_name))
                         .size(base * 0.8)
                         .color(pal.text_dim),
                 );
             });
+        #[cfg(windows)]
+        if let Some(on) = clicked {
+            self.set_single_window(on, ctx);
+        }
         self.show_help = open;
     }
 
@@ -2068,6 +2484,10 @@ impl eframe::App for App {
             .show(ui, |ui| {
                 self.show_content(ui, &ctx);
             });
+        #[cfg(windows)]
+        if let Some((path, arrived)) = self.forward_shown.take() {
+            log::info!("forwarded {} shown {:.1} ms after the request arrived", path.display(), arrived.elapsed().as_secs_f64() * 1000.0);
+        }
         self.show_context_menu(&ctx);
         self.show_help(&ctx);
         // Last, so that it sees the diagram drawing and highlighting show_content asked for.
@@ -2099,6 +2519,14 @@ impl eframe::App for App {
             s.theme = self.saved_theme;
         }
         eframe::set_value(storage, eframe::APP_KEY, &s);
+    }
+
+    /// Runs after `save`. Frees the single-window pipe name: from here on
+    /// senders get `refused` and claim the role themselves instead of reaching a window
+    /// that is going away.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        #[cfg(windows)]
+        crate::instance::shutdown();
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
@@ -2279,8 +2707,8 @@ fn key_commands(i: &mut egui::InputState, typing: bool) -> Vec<Cmd> {
 
 /// The file a dropped folder opens: its README or index, else the first Markdown file
 /// by name. Only this folder is looked at, as the drop and the command line are handled
-/// on the UI thread.
-fn markdown_in_folder(dir: &Path) -> Option<PathBuf> {
+/// on the UI thread (a forwarded folder is looked at on its worker thread).
+pub(crate) fn markdown_in_folder(dir: &Path) -> Option<PathBuf> {
     if let Some(p) = FOLDER_INDEX.iter().map(|n| dir.join(n)).find(|p| p.is_file()) {
         return Some(p);
     }
@@ -2841,6 +3269,333 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// What the pipe thread and the worker make of a forwarded open, done here on the test
+    /// thread: a ticket taken at "commit", then `resolve_forward`.
+    #[cfg(windows)]
+    fn forwarded(app: &App, path: &Path, anchor: Option<&str>, find: Option<&str>) -> crate::instance::ForwardResult {
+        let request = crate::instance::Request { path: path.to_path_buf(), anchor: anchor.map(Into::into), find: find.map(Into::into) };
+        let gen = take_ticket(&app.open_tickets);
+        let outcome = crate::instance::resolve_forward(&request);
+        crate::instance::ForwardResult { gen, request, outcome, arrived: Instant::now() }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forward_opens_a_new_file_and_back_returns() {
+        let (mut app, ctx, dir, a, _missing) = app_showing_a_page("fwd-new");
+        let b = dir.join("b.md");
+        std::fs::write(&b, "# B\n").unwrap();
+        let nav_before = app.nav_gen;
+        let r = forwarded(&app, &b, None, None);
+        app.apply_forward(r, &ctx);
+        assert_eq!(app.path.as_ref(), Some(&b));
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.nav_gen, nav_before, "applying a forward is not a UI navigation");
+        app.go_history(-1, &ctx);
+        assert!(app.nav_gen > nav_before);
+        assert_eq!(app.path, Some(a));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forward_of_the_shown_file_does_not_reload_or_duplicate() {
+        let (mut app, ctx, dir, a, _missing) = app_showing_a_page("fwd-same");
+        std::fs::write(&a, "# A\n\n## x\n").unwrap();
+        app.reload(&ctx, false);
+        let gen = app.gen;
+        let r = forwarded(&app, &a, None, None);
+        app.apply_forward(r, &ctx);
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.gen, gen, "the document must not be parsed again");
+        assert!(app.jump.is_none());
+        let r = forwarded(&app, &a, Some("x"), None);
+        app.apply_forward(r, &ctx);
+        assert_eq!(app.history.len(), 1);
+        assert!(app.jump.is_some(), "the anchor jumps in the shown page");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forward_unreadable_keeps_the_page_with_a_status() {
+        let (mut app, ctx, dir, a, missing) = app_showing_a_page("fwd-missing");
+        let r = forwarded(&app, &missing, Some("x"), Some("y"));
+        app.apply_forward(r, &ctx);
+        assert!(app.doc.is_some());
+        assert!(app.error.is_none());
+        assert_eq!(app.path, Some(a));
+        assert_eq!(app.history.len(), 1);
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.starts_with("Cannot read ")), "{:?}", app.status);
+        assert!(!app.search.open, "find is not applied after a failed load");
+        assert_eq!(app.pending_anchor, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forward_from_the_welcome_screen_shows_the_error_screen() {
+        let dir = fresh_dir("fwd-welcome");
+        let ctx = Context::default();
+        let mut app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), Args::default());
+        let r = forwarded(&app, &dir.join("missing.md"), None, None);
+        app.apply_forward(r, &ctx);
+        assert!(app.doc.is_none());
+        assert!(app.path.is_none());
+        assert!(app.error.as_ref().is_some_and(|e| e.starts_with("Cannot read ")), "{:?}", app.error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_slow_forward_result_is_dropped_after_a_newer_open() {
+        let (mut app, ctx, dir, _a, _missing) = app_showing_a_page("fwd-slow");
+        let (slow, other) = (dir.join("slow.md"), dir.join("other.md"));
+        std::fs::write(&slow, "# Slow\n").unwrap();
+        std::fs::write(&other, "# Other\n").unwrap();
+        let r = forwarded(&app, &slow, None, None);
+        assert!(app.load_path(other.clone(), true, &ctx));
+        app.apply_forward(r, &ctx);
+        assert_eq!(app.path, Some(other));
+        assert_eq!(app.history.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_forward_result_is_dropped_after_go_history() {
+        let (mut app, ctx, dir, a, _missing) = app_showing_a_page("fwd-history");
+        let (slow, b) = (dir.join("slow.md"), dir.join("b.md"));
+        std::fs::write(&slow, "# Slow\n").unwrap();
+        std::fs::write(&b, "# B\n").unwrap();
+        assert!(app.load_path(b, true, &ctx));
+        // Committed after the open of b, so only `go_history`'s own navigation makes it stale.
+        let r = forwarded(&app, &slow, None, None);
+        app.go_history(-1, &ctx);
+        app.apply_forward(r, &ctx);
+        assert_eq!(app.path, Some(a));
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.history_pos, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_forward_does_not_make_an_older_one_stale() {
+        let (mut app, ctx, dir, _a, missing) = app_showing_a_page("fwd-err-order");
+        let b = dir.join("b.md");
+        std::fs::write(&b, "# B\n").unwrap();
+        let rb = forwarded(&app, &b, None, None);
+        let rmissing = forwarded(&app, &missing, None, None);
+        app.apply_forward(rmissing, &ctx);
+        app.apply_forward(rb, &ctx);
+        assert_eq!(app.path.as_ref(), Some(&b));
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.history[1].path, b);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_forward_retries_the_file_of_the_error_screen() {
+        // Started on a file that did not exist yet; the user creates it and opens it again.
+        let dir = fresh_dir("fwd-retry");
+        let missing = dir.join("later.md");
+        let ctx = Context::default();
+        let mut app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), Args { files: vec![missing.clone()], ..Args::default() });
+        assert!(app.doc.is_none());
+        assert!(app.error.is_some());
+        assert_eq!(app.path.as_ref(), Some(&missing));
+        std::fs::write(&missing, "# Later\n").unwrap();
+        let r = forwarded(&app, &missing, None, None);
+        app.apply_forward(r, &ctx);
+        assert!(app.doc.is_some());
+        assert!(app.error.is_none());
+        assert_eq!(app.history.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accept_refuses_a_hung_window_and_a_full_worker_cap() {
+        let count = AtomicUsize::new(0);
+        assert!(accepts_forward(&count, false));
+        assert!(!accepts_forward(&count, true), "a hung window refuses");
+        count.store(MAX_FORWARD_WORKERS - 1, Ordering::SeqCst);
+        assert!(accepts_forward(&count, false), "one place is still free");
+        count.store(MAX_FORWARD_WORKERS, Ordering::SeqCst);
+        assert!(!accepts_forward(&count, false), "every place is taken: the sender keeps its file");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn worker_slots_are_capped_and_given_back() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut held: Vec<WorkerSlot> = (0..MAX_FORWARD_WORKERS).map(|_| WorkerSlot::take(&count, MAX_FORWARD_WORKERS).expect("a free slot")).collect();
+        assert!(WorkerSlot::take(&count, MAX_FORWARD_WORKERS).is_none(), "all slots are taken");
+        held.pop();
+        assert_eq!(count.load(Ordering::SeqCst), MAX_FORWARD_WORKERS - 1);
+        let again = WorkerSlot::take(&count, MAX_FORWARD_WORKERS);
+        assert!(again.is_some());
+        drop(again);
+        drop(held);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_current_forward_result_is_applied() {
+        let (mut app, ctx, dir, _a, _missing) = app_showing_a_page("fwd-current");
+        let b = dir.join("b.md");
+        std::fs::write(&b, "# B\n").unwrap();
+        let r = forwarded(&app, &b, None, None);
+        app.apply_forward(r, &ctx);
+        assert_eq!(app.path, Some(b));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forwards_committed_together_all_land_in_history() {
+        // Explorer multi-select: each request is committed before the earlier results are
+        // applied; every file is pushed, in the order the results arrive, and the last is shown.
+        let (mut app, ctx, dir, a, _missing) = app_showing_a_page("fwd-multi");
+        let (b, c) = (dir.join("b.md"), dir.join("c.md"));
+        std::fs::write(&b, "# B\n").unwrap();
+        std::fs::write(&c, "# C\n").unwrap();
+        // The old page was scrolled; no frame draws in between the two results.
+        app.scroll_offset = 500.0;
+        let rb = forwarded(&app, &b, None, None);
+        let rc = forwarded(&app, &c, None, None);
+        app.apply_forward(rb, &ctx);
+        app.apply_forward(rc, &ctx);
+        assert_eq!(app.path.as_ref(), Some(&c));
+        let paths: Vec<&Path> = app.history.iter().map(|v| v.path.as_path()).collect();
+        assert_eq!(paths, [a.as_path(), &b, &c]);
+        assert_eq!(app.history[0].offset, 500.0);
+        assert_eq!(app.history[1].offset, 0.0, "b was never scrolled");
+        // Results that finish out of order apply in the order they reach the UI thread: both
+        // land, the last one to arrive shown.
+        let (d, e) = (dir.join("d.md"), dir.join("e.md"));
+        std::fs::write(&d, "# D\n").unwrap();
+        std::fs::write(&e, "# E\n").unwrap();
+        let rd = forwarded(&app, &d, None, None);
+        let re = forwarded(&app, &e, None, None);
+        app.apply_forward(re, &ctx);
+        app.apply_forward(rd, &ctx);
+        assert_eq!(app.path.as_ref(), Some(&d));
+        let paths: Vec<&Path> = app.history.iter().map(|v| v.path.as_path()).collect();
+        assert_eq!(paths, [a.as_path(), &b, &c, &e, &d]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn find_rules() {
+        let (mut app, ctx, dir, a, missing) = app_showing_a_page("fwd-find");
+        // Same file: the search opens with the term, replacing the query, focused.
+        app.search.query = "old".into();
+        let r = forwarded(&app, &a, None, Some("term"));
+        app.apply_forward(r, &ctx);
+        assert!(app.search.open);
+        assert_eq!(app.search.query, "term");
+        assert!(app.search.focus_pending);
+        // An empty find leaves an open search alone.
+        app.search.focus_pending = false;
+        let r = forwarded(&app, &a, None, None);
+        app.apply_forward(r, &ctx);
+        assert!(app.search.open);
+        assert_eq!(app.search.query, "term");
+        let r = forwarded(&app, &a, None, Some(""));
+        app.apply_forward(r, &ctx);
+        assert_eq!(app.search.query, "term");
+        assert!(!app.search.focus_pending);
+        // A failed load does not apply find.
+        let r = forwarded(&app, &missing, None, Some("other"));
+        app.apply_forward(r, &ctx);
+        assert_eq!(app.search.query, "term");
+        // A successful load does.
+        let b = dir.join("b.md");
+        std::fs::write(&b, "# B\n").unwrap();
+        let r = forwarded(&app, &b, None, Some("bee"));
+        app.apply_forward(r, &ctx);
+        assert_eq!(app.path, Some(b));
+        assert_eq!(app.search.query, "bee");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forward_folder_and_lnk() {
+        let _com = crate::win::ComApartment::init();
+        let dir = fresh_dir("fwd-folder");
+        let notes = dir.join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        std::fs::write(notes.join("README.md"), "# Notes\n\n## x\n").unwrap();
+        let req = |p: &Path| crate::instance::Request { path: p.to_path_buf(), anchor: None, find: None };
+        let opened = crate::instance::resolve_forward(&req(&notes)).unwrap_or_else(|e| panic!("the folder's README: {e}"));
+        assert_eq!(opened.path, notes.join("README.md"));
+        assert!(opened.decoded.text.starts_with("# Notes"));
+        assert!(opened.stamp.is_some());
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let err = crate::instance::resolve_forward(&req(&empty)).err().expect("an empty folder fails");
+        assert!(err.starts_with("No Markdown files in "), "{err}");
+        let lnk = dir.join("notes.lnk");
+        assert!(crate::win::create_shortcut(&lnk, &notes.join("README.md")));
+        let opened = crate::instance::resolve_forward(&req(&lnk)).unwrap_or_else(|e| panic!("the shortcut's target: {e}"));
+        assert_eq!(opened.path, notes.join("README.md"));
+        let bogus = dir.join("bogus.lnk");
+        std::fs::write(&bogus, "not a shortcut").unwrap();
+        let err = crate::instance::resolve_forward(&req(&bogus)).err().expect("a bogus shortcut fails");
+        assert!(err.ends_with("does not point to a file"), "{err}");
+        // Through the app: the folder's README is shown, with the anchor waiting for it.
+        let ctx = Context::default();
+        let mut app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), Args::default());
+        let r = forwarded(&app, &notes, Some("x"), None);
+        app.apply_forward(r, &ctx);
+        assert_eq!(app.path, Some(notes.join("README.md")));
+        assert_eq!(app.pending_anchor.as_deref(), Some("x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn refused_paths_are_not_opened() {
+        let dir = fresh_dir("fwd-refused");
+        let con = crate::instance::make_absolute(Path::new("CON"));
+        for p in [PathBuf::from(r"\\.\pipe\x"), PathBuf::from(r"\\localhost\pipe\x"), PathBuf::from(r"\\?\UNC\localhost\pipe\x"), con, dir.join("CON"), dir.join("nul.md")] {
+            let req = crate::instance::Request { path: p.clone(), anchor: None, find: None };
+            let err = crate::instance::resolve_forward(&req).err().unwrap_or_else(|| panic!("{} must be refused", p.display()));
+            assert!(err.starts_with("Unsupported path: "), "{}: {err}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn started_same_window_comes_from_args() {
+        assert!(app_with_args(Args { window: Some(WindowChoice::SameWindow), ..Args::default() }).started_same_window);
+        assert!(!app_with_args(Args { window: Some(WindowChoice::NewWindow), ..Args::default() }).started_same_window);
+        let app = app_with_args(Args::default());
+        assert!(!app.started_same_window);
+        // Headless: no window handle, so nothing is served.
+        assert!(app.hwnd.is_none() && app.server.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn forward_closes_the_context_menu() {
+        let (mut app, ctx, dir, _a, _missing) = app_showing_a_page("fwd-menu");
+        let b = dir.join("b.md");
+        std::fs::write(&b, "# B\n").unwrap();
+        app.menu = Some(ContextMenu { pos: Pos2::ZERO, link: None, image: None, code: None, rect: Rect::NOTHING, copy_rect: None });
+        let r = forwarded(&app, &b, None, None);
+        app.apply_forward(r, &ctx);
+        assert!(app.menu.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(windows)]
     #[test]
     fn only_the_open_file_counts_as_watched() {
@@ -2857,5 +3612,281 @@ mod tests {
             assert!(!is_watched_file(&dir.join(name), &target), "{name}");
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A headless window wired to a test pipe name and a test registry key, so the setting
+    /// tests never touch the real `SingleWindow` value or a real mdread's pipe. On drop it
+    /// stops whatever this window serves and waits for the name to be free, also when the
+    /// test fails, then deletes the key.
+    #[cfg(windows)]
+    struct TestWindow {
+        app: App,
+        ctx: Context,
+        name: String,
+        key: crate::instance::tests::TestKey,
+        _serial: std::sync::RwLockReadGuard<'static, ()>,
+    }
+
+    #[cfg(windows)]
+    impl TestWindow {
+        fn new(tag: &str, args: Args) -> TestWindow {
+            let serial = crate::instance::pipe_tests::shared();
+            let ctx = Context::default();
+            let mut app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), args);
+            let key = crate::instance::tests::TestKey::new(&format!("app-{tag}"));
+            let name = crate::instance::pipe_tests::test_name();
+            app.pipe_name = Some(name.clone());
+            app.setting_subkey = Some(key.0.clone());
+            TestWindow { app, ctx, name, key, _serial: serial }
+        }
+
+        fn set(&mut self, on: bool) {
+            self.app.set_single_window(on, &self.ctx);
+        }
+
+        fn saved(&self) -> bool {
+            crate::instance::read_setting_at(&self.key.0)
+        }
+
+        /// Whether some pipe holds the name: creating it again fails with `Taken`.
+        fn name_taken(&self) -> bool {
+            let id = crate::instance::own_identity().expect("own_identity");
+            match crate::instance::create_pipe(&self.name, &id) {
+                Ok(_pipe) => false,
+                Err(crate::instance::CreateError::Taken) => true,
+                Err(crate::instance::CreateError::Other(e)) => panic!("create_pipe: {e}"),
+            }
+        }
+
+        /// Waits up to 2 s for a server this window stopped to free the name. It normally
+        /// does within `stop_serving`'s own 200 ms wait, but a busy test machine may be slower.
+        fn name_freed(&self) -> bool {
+            let until = Instant::now() + Duration::from_secs(2);
+            loop {
+                let finished = self.app.stopped_server.as_ref().is_none_or(|s| s.is_finished());
+                if finished && !self.name_taken() {
+                    return true;
+                }
+                if Instant::now() >= until {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn send(&self, path: &Path) -> crate::instance::ForwardOutcome {
+            let id = crate::instance::own_identity().expect("own_identity");
+            let req = crate::instance::Request { path: path.to_path_buf(), anchor: None, find: None };
+            crate::instance::forward(&self.name, &id, &req, Instant::now() + Duration::from_secs(5))
+        }
+
+        /// Forwards `path` and checks that this window took it: `Delivered`, and the worker's
+        /// result on the window's channel.
+        fn delivers(&self, path: &Path) {
+            assert_eq!(self.send(path), crate::instance::ForwardOutcome::Delivered);
+            let r = self.app.forward_rx.recv_timeout(Duration::from_secs(5)).expect("the forward reaches this window");
+            assert_eq!(r.request.path, path);
+        }
+
+        fn status(&self) -> Option<&str> {
+            self.app.status.as_ref().map(|(s, _)| s.as_str())
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            for server in [self.app.server.take(), self.app.stopped_server.take()].into_iter().flatten() {
+                server.stop_serving();
+                if !crate::instance::pipe_tests::wait_finished(&server) && !std::thread::panicking() {
+                    panic!("the window's server did not finish");
+                }
+            }
+        }
+    }
+
+    /// A file for forwards to open.
+    #[cfg(windows)]
+    fn page(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = fresh_dir(tag);
+        let file = dir.join("page.md");
+        std::fs::write(&file, "# Page\n").unwrap();
+        (dir, file)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turning_on_starts_serving_when_nobody_does() {
+        let (dir, file) = page("set-on");
+        let mut w = TestWindow::new("on", Args::default());
+        assert!(!w.name_taken());
+        w.set(true);
+        assert!(w.saved() && w.app.setting_on);
+        assert!(w.app.server.is_some());
+        assert!(w.name_taken());
+        w.delivers(&file);
+        assert_eq!(w.status(), None);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turning_on_does_nothing_when_another_window_receives() {
+        let mut w = TestWindow::new("on-taken", Args::default());
+        let other = crate::instance::pipe_tests::Serving::start(&w.name, true);
+        w.set(true);
+        assert!(w.saved() && w.app.setting_on);
+        assert!(w.app.server.is_none());
+        assert_eq!(w.status(), None, "nothing to say: the other window receives");
+        assert_eq!(w.send(Path::new(r"C:\x.md")), crate::instance::ForwardOutcome::Delivered);
+        assert!(other.commits.recv_timeout(Duration::from_secs(5)).is_ok(), "the other window got it");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turning_off_stops_a_receiver_started_by_the_setting() {
+        let mut w = TestWindow::new("off", Args::default());
+        w.set(true);
+        assert!(w.name_taken());
+        w.set(false);
+        assert!(!w.saved() && !w.app.setting_on);
+        assert!(w.app.server.is_none());
+        assert!(w.name_freed(), "the name is free again");
+        assert_eq!(w.send(Path::new(r"C:\x.md")), crate::instance::ForwardOutcome::NoReceiver);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turning_off_keeps_a_same_window_receiver() {
+        let (dir, file) = page("set-off-same");
+        let mut w = TestWindow::new("off-same", Args { window: Some(WindowChoice::SameWindow), ..Args::default() });
+        assert!(w.app.started_same_window);
+        // As `main` and `App::new` do for a `--same-window` launch that claimed.
+        let id = crate::instance::own_identity().unwrap();
+        let pipe = crate::instance::create_pipe(&w.name, &id).unwrap();
+        w.app.start_serving(pipe, &w.ctx);
+        w.set(false);
+        assert!(!w.saved() && !w.app.setting_on);
+        assert!(w.app.server.is_some(), "a --same-window window keeps listening");
+        assert!(w.name_taken());
+        w.delivers(&file);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `--same-window` window that claimed at launch: switching the setting on and off
+    /// again, twice, never stops it receiving.
+    #[cfg(windows)]
+    #[test]
+    fn on_off_on_off_in_a_same_window_window_keeps_listening() {
+        let (dir, file) = page("set-same-twice");
+        let mut w = TestWindow::new("same-twice", Args { window: Some(WindowChoice::SameWindow), ..Args::default() });
+        // As `main` and `App::new` do for a `--same-window` launch that claimed.
+        let id = crate::instance::own_identity().unwrap();
+        let pipe = crate::instance::create_pipe(&w.name, &id).unwrap();
+        w.app.start_serving(pipe, &w.ctx);
+        assert!(w.name_taken());
+        w.delivers(&file);
+        for _ in 0..2 {
+            w.set(true);
+            assert!(w.saved() && w.name_taken());
+            w.delivers(&file);
+            w.set(false);
+            assert!(!w.saved());
+            assert!(w.app.server.is_some() && w.name_taken(), "still listening after switching it off");
+            w.delivers(&file);
+        }
+        assert_eq!(w.status(), None);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn turning_on_in_a_stdin_window_does_not_serve() {
+        // A real `-` launch would read this process's stdin in `App::new`; the flag is what
+        // `App::new` sets from `args.stdin`. `--screenshot` windows are the same.
+        assert!(app_with_args(Args { screenshot: Some(PathBuf::from("x.png")), ..Args::default() }).never_receives);
+        assert!(!app_with_args(Args::default()).never_receives);
+        let mut w = TestWindow::new("on-stdin", Args::default());
+        w.app.never_receives = true;
+        w.set(true);
+        assert!(w.saved() && w.app.setting_on, "the value is still written");
+        assert!(w.app.server.is_none());
+        assert!(!w.name_taken());
+    }
+
+    /// A receiver the setting started: off frees the name, on claims it again, twice.
+    #[cfg(windows)]
+    #[test]
+    fn turning_off_then_on_restarts_serving() {
+        let (dir, file) = page("set-off-on");
+        let mut w = TestWindow::new("off-on", Args::default());
+        for _ in 0..2 {
+            w.set(true);
+            assert!(w.name_taken());
+            assert!(w.app.server.is_some());
+            w.delivers(&file);
+            w.set(false);
+            assert!(w.name_freed());
+        }
+        assert_eq!(w.status(), None);
+        drop(w);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Re-enabling: a server whose thread is still busy after `stop_serving` keeps
+    /// the name, so turning the setting on again does not claim and says when it will.
+    #[cfg(windows)]
+    #[test]
+    fn turning_off_then_on_while_the_old_server_runs_says_so() {
+        let mut w = TestWindow::new("off-on-busy", Args::default());
+        // A server stuck in `commit` (as if a file took long to hand over) until `release`.
+        let (entered_tx, entered) = mpsc::channel::<()>();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let (entered_tx, release_rx) = (std::sync::Mutex::new(entered_tx), std::sync::Mutex::new(release_rx));
+        let id = crate::instance::own_identity().unwrap();
+        let pipe = crate::instance::create_pipe(&w.name, &id).unwrap();
+        w.app.server = Some(pipe.serve(
+            Arc::new(|_: &crate::instance::Request| true),
+            Arc::new(move |_| {
+                let _ = entered_tx.lock().unwrap_or_else(|e| e.into_inner()).send(());
+                let _ = release_rx.lock().unwrap_or_else(|e| e.into_inner()).recv_timeout(Duration::from_secs(5));
+            }),
+        ));
+        w.app.setting_on = true;
+        let name = w.name.clone();
+        let sender = std::thread::spawn(move || {
+            let req = crate::instance::Request { path: PathBuf::from(r"C:\x.md"), anchor: None, find: None };
+            crate::instance::forward(&name, &id, &req, Instant::now() + Duration::from_secs(5))
+        });
+        entered.recv_timeout(Duration::from_secs(5)).expect("the commit started");
+        w.set(false);
+        assert!(w.app.server.is_none());
+        assert!(w.app.stopped_server.as_ref().is_some_and(|s| !s.is_finished()), "still busy in commit");
+        w.set(true);
+        assert!(w.saved() && w.app.setting_on, "the box stays on");
+        assert!(w.app.server.is_none(), "no new pipe while the old one is held");
+        assert_eq!(w.status(), Some("Receiving starts with the next window"));
+        // Once the old thread is through, turning it on again claims.
+        release.send(()).unwrap();
+        let _ = sender.join();
+        assert!(crate::instance::pipe_tests::wait_finished(w.app.stopped_server.as_ref().unwrap()));
+        w.set(true);
+        assert!(w.app.server.is_some() && w.name_taken());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_failure_sets_a_status_and_leaves_it_off() {
+        let mut w = TestWindow::new("write-fails", Args::default());
+        // Longer than the registry's 255-character limit for a key name.
+        w.app.setting_subkey = Some(format!(r"Software\{}", "x".repeat(300)));
+        w.set(true);
+        assert!(w.status().is_some_and(|s| s.starts_with("Cannot save the setting: ")), "{:?}", w.status());
+        assert!(!w.app.setting_on);
+        assert!(w.app.server.is_none());
+        assert!(!w.name_taken());
     }
 }
