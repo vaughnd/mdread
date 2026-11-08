@@ -463,7 +463,8 @@ impl App {
         }
     }
 
-    /// Returns whether the file was read; on failure the error screen shows instead.
+    /// Returns whether the file was read. On failure a shown page stays and the status bar
+    /// says why; with nothing shown, or for a history move, the error screen shows instead.
     fn load_path(&mut self, path: PathBuf, push_history: bool, ctx: &Context) -> bool {
         self.load_path_in(path, push_history, None, ctx)
     }
@@ -502,7 +503,16 @@ impl App {
                 true
             }
             Err(e) => {
-                self.error = Some(format!("Cannot read {}: {e}", links::display_path(&path)));
+                let msg = format!("Cannot read {}: {e}", links::display_path(&path));
+                // An open that fails (Ctrl+O, a drop, a link, a sidebar click) leaves the page
+                // alone and says why in the status bar. A history move (`push_history` false)
+                // or an empty window still shows the error screen: there is nothing to keep.
+                if push_history && self.doc.is_some() {
+                    self.set_status(msg);
+                    self.pending_anchor = None;
+                    return false;
+                }
+                self.error = Some(msg);
                 self.doc = None;
                 self.path = Some(path);
                 ctx.send_viewport_cmd(ViewportCommand::Title("mdread".into()));
@@ -2599,6 +2609,87 @@ mod tests {
         app.load_path(next, true, &ctx);
         assert!(app.doc.is_some());
         assert_eq!(app.pending_anchor, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An app showing `a.md` from a fresh temp folder, and a path in it that cannot be read.
+    fn app_showing_a_page(tag: &str) -> (App, Context, PathBuf, PathBuf, PathBuf) {
+        let dir = dunce::canonicalize(std::env::temp_dir()).unwrap().join(format!("mdread-{tag}-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.md");
+        std::fs::write(&a, "# A\n").unwrap();
+        let ctx = Context::default();
+        let args = Args { files: vec![a.clone()], ..Args::default() };
+        let app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), args);
+        assert!(app.doc.is_some(), "a.md should load");
+        let missing = dir.join("missing.md");
+        (app, ctx, dir, a, missing)
+    }
+
+    #[test]
+    fn failed_open_keeps_the_shown_page() {
+        let (mut app, ctx, dir, a, missing) = app_showing_a_page("keep-page");
+        app.pending_anchor = Some("old".into());
+        assert!(!app.load_path(missing, true, &ctx));
+        assert!(app.doc.is_some());
+        assert!(app.error.is_none());
+        assert_eq!(app.path, Some(a));
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history_pos, 0);
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.starts_with("Cannot read ")), "{:?}", app.status);
+        assert_eq!(app.pending_anchor, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_open_from_the_welcome_screen_shows_the_error_screen() {
+        let dir = dunce::canonicalize(std::env::temp_dir()).unwrap().join(format!("mdread-welcome-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = Context::default();
+        let mut app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), Args::default());
+        assert!(app.doc.is_none());
+        assert!(!app.load_path(dir.join("missing.md"), true, &ctx));
+        assert!(app.error.is_some());
+        assert!(app.doc.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_history_move_still_shows_the_error_screen() {
+        let (mut app, ctx, dir, _a, missing) = app_showing_a_page("history-move");
+        assert!(!app.load_path(missing, false, &ctx));
+        assert!(app.error.is_some());
+        assert!(app.doc.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clicking_a_link_to_an_unreadable_file_keeps_the_page_and_drops_the_anchor() {
+        use std::os::windows::fs::OpenOptionsExt;
+        // The target must exist, or `open_local` stops at "Not found" before it reads
+        // anything. Holding it open with no sharing makes the read itself fail.
+        let (mut app, ctx, dir, a, _missing) = app_showing_a_page("link-load");
+        let locked = dir.join("locked.md");
+        std::fs::write(&locked, "# Locked\n").unwrap();
+        let _hold = std::fs::OpenOptions::new().read(true).share_mode(0).open(&locked).unwrap();
+        assert!(locked.is_file());
+        assert!(std::fs::read(&locked).is_err(), "the held file should not be readable");
+        app.pending_anchor = Some("old".into());
+        let shown = app.doc.clone().unwrap();
+        app.open_local(locked, Some("x".into()), &ctx);
+        // The same parsed page is still shown, so the title (set only with a new page or
+        // the error screen) is unchanged too.
+        assert!(app.doc.as_ref().is_some_and(|d| Arc::ptr_eq(d, &shown)));
+        assert!(app.error.is_none());
+        assert_eq!(app.path, Some(a));
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history_pos, 0);
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.starts_with("Cannot read ")), "{:?}", app.status);
+        assert_eq!(app.pending_anchor, None);
+        drop(_hold);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
