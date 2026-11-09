@@ -122,7 +122,8 @@ pub fn encode(r: &Request) -> Vec<u16> {
 }
 
 /// The other end of `encode`. None for anything else: another number of fields, a path
-/// that is not absolute, text that is not UTF-16, or a message over the cap.
+/// that is not absolute or names a device (mdread's senders do not send those, so this
+/// only stops a message made by hand), text that is not UTF-16, or a message over the cap.
 pub fn decode(units: &[u16]) -> Option<Request> {
     if units.len() > MAX_UNITS {
         return None;
@@ -133,7 +134,7 @@ pub fn decode(units: &[u16]) -> Option<Request> {
         return None;
     }
     let path = path_from_units(path);
-    if !path.is_absolute() {
+    if !path.is_absolute() || names_a_device(&path) {
         return None;
     }
     let text = |f: &[u16]| if f.is_empty() { Ok(None) } else { String::from_utf16(f).map(Some) };
@@ -605,6 +606,7 @@ mod tests {
         let msg = |p: &Path, rest: &str| [path_units(p), units(rest)].concat();
         assert!(decode(&msg(&abs, "\0\0")).is_some());
         assert_eq!(decode(&msg(Path::new("a.md"), "\0\0")), None, "relative path");
+        assert_eq!(decode(&msg(&std::env::temp_dir().join("nul.md"), "\0\0")), None, "a device name");
         assert_eq!(decode(&msg(&abs, "\0")), None, "two fields");
         assert_eq!(decode(&msg(&abs, "\0\0\0")), None, "four fields");
         assert_eq!(decode(&[]), None);
