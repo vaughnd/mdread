@@ -67,10 +67,46 @@ const MAX_UNITS: usize = 64 * 1024;
 
 /// What a launch sends: its first file, made absolute here because the receiver has
 /// another current folder, and the anchor and `--find` given with it.
+/// None for a device, pipe or mailslot name, which such a launch opens in a window of its own.
 fn request_for(args: &Args) -> Option<Request> {
     let path = std::path::absolute(args.files.first()?).ok()?;
+    if names_a_device(&path) {
+        return None;
+    }
     let given = |s: &Option<String>| s.clone().filter(|s| !s.is_empty());
     Some(Request { path, anchor: given(&args.anchor), find: given(&args.find) })
+}
+
+/// Whether a path names a device, a pipe or a mailslot rather than a file. The receiver
+/// reads a handed-over file on its UI thread, and reading a pipe with no writer or a
+/// serial port can block until it answers, which would freeze a window the user already
+/// has open. A path wrongly taken for one only costs a window of its own. Works on the
+/// text, so that it reads the same in tests on every OS.
+fn names_a_device(path: &Path) -> bool {
+    let s = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    // `\\.\` reaches devices and pipes. `\\?\` does too, except as `\\?\C:\` or
+    // `\\?\UNC\server\share`, which are files and shares written long.
+    if s.starts_with(r"\\.\") {
+        return true;
+    }
+    let unc = if let Some(rest) = s.strip_prefix(r"\\?\") {
+        match rest.strip_prefix(r"unc\") {
+            Some(unc) => Some(unc),
+            None if rest.as_bytes().get(1..3) == Some(b":\\") => None,
+            None => return true,
+        }
+    } else {
+        s.strip_prefix(r"\\")
+    };
+    // `\\server\pipe\name` and `\\server\mailslot\name` are another machine's (or this one's).
+    if unc.and_then(|u| u.split('\\').nth(1)).is_some_and(|share| share == "pipe" || share == "mailslot") {
+        return true;
+    }
+    // The old DOS device names, in any folder and with any extension, as Windows reads them.
+    let name = s.rsplit('\\').next().unwrap_or("");
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches([' ', ':']);
+    let numbered = |p: &str| stem.strip_prefix(p).is_some_and(|n| matches!(n, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"));
+    matches!(stem, "con" | "prn" | "aux" | "nul" | "conin$" | "conout$") || numbered("com") || numbered("lpt")
 }
 
 /// `path NUL anchor NUL find` in UTF-16, an empty field meaning none. UTF-16 because a
@@ -580,5 +616,44 @@ mod tests {
         assert!(r.path.is_absolute() && r.path.ends_with("a.md"));
         assert_eq!((r.anchor.as_deref(), r.find), (Some("x"), None));
         assert_eq!(request_for(&args(&[])), None);
+    }
+
+    #[test]
+    fn devices_pipes_and_mailslots_are_not_handed_over() {
+        for p in [
+            r"\\.\pipe\x",
+            r"\\.\COM1",
+            r"\\.\C:\notes\a.md",
+            r"\\?\pipe\x",
+            r"\\?\GLOBALROOT\Device\Null",
+            r"\\server\pipe\x",
+            r"\\localhost\MailSlot\x",
+            r"\\?\UNC\server\pipe\x",
+            r"C:\notes\CON",
+            r"C:\notes\nul.md",
+            r"C:\notes\com1 .md",
+            r"C:\notes\LPT9",
+            r"C:\notes\COM¹.md",
+            r"C:\notes\CONIN$",
+            r"COM1:",
+            "//./pipe/x",
+        ] {
+            assert!(names_a_device(Path::new(p)), "{p}");
+        }
+        for p in [
+            r"C:\notes\a.md",
+            r"\\?\C:\notes\a.md",
+            r"\\server\share\a.md",
+            r"\\?\UNC\server\share\a.md",
+            r"\\server\share\pipe\a.md",
+            r"C:\notes\pipe\a.md",
+            r"C:\notes\console.md",
+            r"C:\notes\com10.md",
+            r"C:\notes\com.md",
+            r"C:\notes\aux-notes.md",
+            "/home/a/notes.md",
+        ] {
+            assert!(!names_a_device(Path::new(p)), "{p}");
+        }
     }
 }
