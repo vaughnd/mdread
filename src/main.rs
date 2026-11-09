@@ -12,6 +12,7 @@ mod links;
 mod mermaid;
 mod render;
 mod search;
+mod single_window;
 #[cfg(windows)]
 mod svg_loader;
 mod text;
@@ -22,7 +23,7 @@ mod win;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
-use app::{Args, ThemeChoice};
+use app::{Args, ThemeChoice, WindowChoice};
 
 const HELP: &str = "\
 mdread — fast Markdown viewer
@@ -36,6 +37,10 @@ OPTIONS:
     --system             Follow the system theme for this session (the default
                          until a theme is picked in mdread)
     --find TERM          Open with the search box filled in
+    --same-window        Open the file in the mdread window that receives files
+                         (Windows; the setting for it is in the ? window)
+    --new-window         Open a window of its own even with that setting on (Windows)
+                         If both are given, the last one wins.
     --screenshot PATH    Save a PNG of the window and exit, once diagrams, images
                          and highlighting are done and at least 1.5 s have passed
     --screenshot-delay N Least delay in ms for --screenshot
@@ -96,6 +101,8 @@ fn parse_args_from(argv: impl IntoIterator<Item = OsString>, exists: impl Fn(&Pa
             "--dark" => args.theme = Some(ThemeChoice::Dark),
             "--light" => args.theme = Some(ThemeChoice::Light),
             "--system" => args.theme = Some(ThemeChoice::System),
+            "--new-window" => args.window = Some(WindowChoice::New),
+            "--same-window" => args.window = Some(WindowChoice::Same),
             "-" => args.stdin = true,
             _ if s.starts_with("--") => exit_with(&format!("unknown option {s}\n{HELP}\n"), 2),
             _ => {
@@ -215,6 +222,14 @@ fn main() -> eframe::Result {
     let mut args = parse_args();
     args.launched = Some(launched);
 
+    // Single-window mode, before any window: hand the file to the window that receives
+    // files and exit, or take the receiving role for this launch's window. With the
+    // setting off, this reads one registry value and does nothing else.
+    #[cfg(windows)]
+    if single_window::forward_or_claim(&args) {
+        return Ok(());
+    }
+
     #[cfg(not(windows))]
     let result = run(native_options(), args);
     #[cfg(windows)]
@@ -266,6 +281,14 @@ mod tests {
         assert_eq!(args.files, [PathBuf::from("a.md"), PathBuf::from("b.md")]);
         assert_eq!(args.anchor, None);
         assert_eq!(parse(&["a.md#x", "b.md#y"], &both).anchor, Some("x".into()));
+    }
+
+    #[test]
+    fn the_last_window_flag_wins() {
+        assert_eq!(parse(&["--same-window", "--new-window", "a.md"], &[]).window, Some(WindowChoice::New));
+        assert_eq!(parse(&["--new-window", "a.md", "--same-window"], &[]).window, Some(WindowChoice::Same));
+        assert_eq!(parse(&["a.md"], &[]).window, None);
+        assert_eq!(parse(&["--same-window", "a.md"], &[]).files, [PathBuf::from("a.md")]);
     }
 
     #[test]

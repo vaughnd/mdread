@@ -141,6 +141,19 @@ there is no terminal. In PowerShell, pipe instead of redirecting
 `$x = mdread ...` capture nothing and `$LASTEXITCODE` is not set. In cmd.exe `>`
 works.
 
+On Windows, files can open in the window that is already open instead of a new
+one: tick "Open files in the window that is already open" in the `?` window. The
+first window opened while it is on receives the files until it closes (or the
+window it was ticked in, if no other receives), and Back returns to the page
+before. `--new-window` opens a window of its own for one launch, and
+`--same-window` sends one launch to the receiving window whatever the setting
+says (a window started with it receives later `--same-window` launches); if both
+are given, the last one wins. Windows reading stdin or taking a `--screenshot`
+never receive, and `--dark`/`--light`/`--system` launches open their own window.
+A launch that hands its file over exits at once, so `Start-Process -Wait` does
+not wait for the window. The setting is the DWORD `SingleWindow` under
+`HKCU\Software\mdread`.
+
 On Windows, links leave the app only for `http`, `https` and `mailto`. A link to
 a local file opens it in its default app only for images, PDF, plain text, data
 files (CSV, JSON, YAML, TOML) and audio/video; anything else (exe, scripts,
