@@ -884,7 +884,13 @@ impl App {
     /// Note where the current file was left, for coming back to it.
     fn save_visit(&mut self) {
         if let Some(cur) = self.history.get_mut(self.history_pos) {
-            cur.offset = self.scroll_offset;
+            // A page opened but not drawn yet (a second file opened in the same frame, as when
+            // several are handed over at once) was left where its open put it, not where the page
+            // before it was scrolled to. End's `f32::MAX` is not a position.
+            cur.offset = match self.pending_offset {
+                Some(o) if o < f32::MAX => o,
+                _ => self.scroll_offset,
+            };
             cur.place = self.place;
             cur.files_dir = self.files_dir.clone();
         }
@@ -3051,6 +3057,25 @@ mod tests {
         app.open_forwarded(req(&sub, None, None), &ctx);
         assert_eq!(app.path, Some(sub.join("README.md")));
         assert_eq!(app.history.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_handed_over_in_one_frame_keep_their_own_offsets() {
+        use crate::single_window::Request;
+        let req = |path: &Path| Request { path: path.to_path_buf(), anchor: None, find: None };
+        let (mut app, ctx, dir, _a, _missing) = app_showing_a_page("handed-together");
+        let (b, c) = (dir.join("b.md"), dir.join("c.md"));
+        std::fs::write(&b, "# B\n").unwrap();
+        std::fs::write(&c, "# C\n").unwrap();
+        // The page shown was drawn and scrolled; no frame draws between the two files.
+        app.scroll_offset = 500.0;
+        app.pending_offset = None;
+        app.open_forwarded(req(&b), &ctx);
+        app.open_forwarded(req(&c), &ctx);
+        assert_eq!(app.history.len(), 3);
+        assert_eq!(app.history[0].offset, 500.0);
+        assert_eq!(app.history[1].offset, 0.0, "b was never drawn: Back to it must open at the top");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
