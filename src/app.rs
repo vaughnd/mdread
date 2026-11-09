@@ -776,11 +776,16 @@ impl App {
         self.dialog_rx = Some(rx);
     }
 
-    /// Opens a file dropped on the window. A dropped folder opens its README or first
-    /// Markdown file (reading a folder as a file fails on Windows with a puzzling "Access
-    /// is denied"), and on Windows a dropped shortcut opens its target. Returns whether a
-    /// document was loaded.
+    /// Opens a file dropped on the window. Returns whether a document was loaded.
     fn open_dropped(&mut self, path: PathBuf, ctx: &Context) -> bool {
+        self.dropped_file(path).is_some_and(|path| self.load_path(path, true, ctx))
+    }
+
+    /// The file a drop opens. A dropped folder opens its README or first Markdown file
+    /// (reading a folder as a file fails on Windows with a puzzling "Access is denied"),
+    /// and on Windows a dropped shortcut opens its target. None, with the reason in the
+    /// status bar, if there is no such file.
+    fn dropped_file(&mut self, path: PathBuf) -> Option<PathBuf> {
         #[cfg(windows)]
         let path = {
             let mut path = path;
@@ -790,7 +795,7 @@ impl App {
                     Some(target) => path = target,
                     None => {
                         self.set_status(format!("{} does not point to a file", links::display_path(&path)));
-                        return false;
+                        return None;
                     }
                 }
             }
@@ -801,23 +806,24 @@ impl App {
                 Some(file) => file,
                 None => {
                     self.set_status(format!("No Markdown files in {}", links::display_path(&path)));
-                    return false;
+                    return None;
                 }
             }
         } else {
             path
         };
-        self.load_path(path, true, ctx)
+        Some(path)
     }
 
     /// Opens a file another launch handed over in single-window mode, as a drop would,
     /// with the anchor and `--find` given with it. It is read on the UI thread, as a drop
-    /// or Ctrl+O is. The file shown already is not read again, so the reading position
-    /// stays unless an anchor moves it.
+    /// or Ctrl+O is. The file shown already, also when a shortcut or folder leads to it, is
+    /// not read again, so the reading position stays unless an anchor moves it.
     #[cfg_attr(not(windows), allow(dead_code))]
     fn open_forwarded(&mut self, r: crate::single_window::Request, ctx: &Context) {
-        let shown = self.doc.is_some() && self.path.is_some() && dunce::canonicalize(&r.path).ok() == self.path;
-        if !shown && !self.open_dropped(r.path, ctx) {
+        let Some(path) = self.dropped_file(r.path) else { return };
+        let shown = self.doc.is_some() && self.path.is_some() && dunce::canonicalize(&path).ok() == self.path;
+        if !shown && !self.load_path(path, true, ctx) {
             return;
         }
         self.pending_anchor = r.anchor;
@@ -3057,6 +3063,22 @@ mod tests {
         app.open_forwarded(req(&sub, None, None), &ctx);
         assert_eq!(app.path, Some(sub.join("README.md")));
         assert_eq!(app.history.len(), 3);
+
+        // The folder again, or its README by name: it is shown already, so the page stays.
+        app.scroll_offset = 300.0;
+        app.pending_offset = None;
+        app.open_forwarded(req(&sub, None, None), &ctx);
+        app.open_forwarded(req(&sub.join("README.md"), None, None), &ctx);
+        assert_eq!(app.history.len(), 3);
+        assert_eq!(app.pending_offset, None, "not read again, so not sent to the top");
+
+        // A folder with no Markdown says so and keeps the page.
+        let empty = dir.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        app.open_forwarded(req(&empty, Some("z"), None), &ctx);
+        assert_eq!(app.path, Some(sub.join("README.md")));
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.starts_with("No Markdown files in ")), "{:?}", app.status);
+        assert_ne!(app.pending_anchor.as_deref(), Some("z"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3076,6 +3098,22 @@ mod tests {
         assert_eq!(app.history.len(), 3);
         assert_eq!(app.history[0].offset, 500.0);
         assert_eq!(app.history[1].offset, 0.0, "b was never drawn: Back to it must open at the top");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_handed_over_shortcut_to_the_shown_file_keeps_the_page() {
+        use crate::single_window::Request;
+        let _com = crate::win::ComApartment::init();
+        let (mut app, ctx, dir, a, _missing) = app_showing_a_page("handed-over-lnk");
+        let lnk = dir.join("a.md.lnk");
+        assert!(crate::win::create_shortcut(&lnk, &a));
+        app.scroll_offset = 300.0;
+        app.pending_offset = None;
+        app.open_forwarded(Request { path: lnk, anchor: None, find: None }, &ctx);
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.pending_offset, None, "not read again, so not sent to the top");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
