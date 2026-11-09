@@ -120,6 +120,19 @@ pub struct Args {
     pub anchor: Option<String>,
     /// `--find TERM`: open with the search box filled in.
     pub find: Option<String>,
+    /// `--new-window` or `--same-window`, whichever came last. Accepted everywhere, so
+    /// scripts work on every system; only single-window mode on Windows reads it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub window: Option<WindowChoice>,
+}
+
+/// Where a launch with a file opens it in single-window mode (Windows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowChoice {
+    /// `--new-window`: a window of its own, even with the setting on.
+    New,
+    /// `--same-window`: the window that receives files, even with the setting off.
+    Same,
 }
 
 enum WatchEvent {
@@ -276,6 +289,20 @@ pub struct App {
     /// Whether the title bar was last made dark (Windows; None before the first frame).
     #[cfg(windows)]
     title_bar_dark: Option<bool>,
+    /// The window, for single-window mode; None without a native window (the tests).
+    #[cfg(windows)]
+    hwnd: Option<isize>,
+    /// Started with `--same-window`: keeps receiving files when the setting is turned off
+    /// in it, as it was asked for on the command line.
+    #[cfg(windows)]
+    same_window: bool,
+    /// Started for stdin or `--screenshot`: never receives files.
+    #[cfg(windows)]
+    never_receives: bool,
+    /// The help window's single-window checkbox, read from the registry when the help
+    /// window opens, so that it shows a change made in another window.
+    #[cfg(windows)]
+    single_window_on: bool,
 }
 
 /// What a folder link opens, in this order.
@@ -406,8 +433,26 @@ impl App {
             screenshot_unsettled: false,
             #[cfg(windows)]
             title_bar_dark: None,
+            #[cfg(windows)]
+            hwnd: {
+                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                match cc.window_handle().map(|h| h.as_raw()) {
+                    Ok(RawWindowHandle::Win32(w)) => Some(w.hwnd.get()),
+                    _ => None,
+                }
+            },
+            #[cfg(windows)]
+            same_window: args.window == Some(WindowChoice::Same),
+            #[cfg(windows)]
+            never_receives: args.stdin || args.screenshot.is_some(),
+            #[cfg(windows)]
+            single_window_on: false,
         };
 
+        // `--find` and the anchor belong to the document they were given with: both are
+        // applied only after a successful load. With no file and no stdin, `--find` still
+        // opens the search box.
+        let mut loaded = false;
         if args.stdin {
             use std::io::Read;
             app.stdin_mode = true;
@@ -419,21 +464,70 @@ impl App {
                     if let Some(enc) = decoded.encoding {
                         app.set_status(format!("Decoded as {enc}"));
                     }
+                    loaded = true;
                 }
                 Ok(_) => app.error = Some("No input on stdin".into()),
                 Err(e) => app.error = Some(format!("Cannot read stdin: {e}")),
             }
         } else if let Some(p) = args.files.first() {
-            if app.load_path(p.clone(), true, ctx) {
+            loaded = app.open_command_line_path(p.clone(), ctx);
+            if loaded {
                 app.pending_anchor = args.anchor.clone();
             }
         }
-        if let Some(q) = &args.find {
-            app.search.open = true;
-            app.search.query = q.clone();
-            app.search.focus_pending = true;
+        // With no file and no stdin there is nothing to load, and `--find` still opens the box.
+        if loaded || (args.files.is_empty() && !args.stdin) {
+            if let Some(q) = &args.find {
+                app.search.open = true;
+                app.search.query = q.clone();
+                app.search.focus_pending = true;
+            }
+        }
+        // `main` took the receiving role for this window (single-window mode).
+        #[cfg(windows)]
+        if let Some(hwnd) = app.hwnd.filter(|_| crate::single_window::has_role()) {
+            crate::single_window::start(hwnd, ctx);
         }
         app
+    }
+
+    /// Opens the file named on the command line; returns whether a document was loaded.
+    /// A plain file costs one read, as before: the `.lnk` check is a string compare and a
+    /// folder is looked for only after the read failed. On Windows a shortcut opens its
+    /// target; a folder opens its README or first Markdown file.
+    fn open_command_line_path(&mut self, path: PathBuf, ctx: &Context) -> bool {
+        #[cfg(windows)]
+        let path = {
+            let mut path = path;
+            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
+                let _com = crate::win::ComApartment::init();
+                match crate::win::shortcut_target(&path) {
+                    Some(target) => path = target,
+                    None => {
+                        self.set_status(format!("{} does not point to a file", links::display_path(&path)));
+                        return false;
+                    }
+                }
+            }
+            path
+        };
+        if self.load_path(path.clone(), true, ctx) {
+            return true;
+        }
+        if !path.is_dir() {
+            return false;
+        }
+        match markdown_in_folder(&path) {
+            Some(file) => self.load_path(file, true, ctx),
+            None => {
+                // The failed read above left "Cannot read <folder>: Access is denied" on the
+                // screen, which misleads: replace it, as "No input on stdin" does.
+                let msg = format!("No Markdown files in {}", links::display_path(&path));
+                self.set_status(msg.clone());
+                self.error = Some(msg);
+                false
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -473,7 +567,8 @@ impl App {
         }
     }
 
-    /// Returns whether the file was read; on failure the error screen shows instead.
+    /// Returns whether the file was read. On failure a shown page stays and the status bar
+    /// says why; with nothing shown, or for a history move, the error screen shows instead.
     fn load_path(&mut self, path: PathBuf, push_history: bool, ctx: &Context) -> bool {
         self.load_path_in(path, push_history, None, ctx)
     }
@@ -511,7 +606,16 @@ impl App {
                 true
             }
             Err(e) => {
-                self.error = Some(format!("Cannot read {}: {e}", links::display_path(&path)));
+                let msg = format!("Cannot read {}: {e}", links::display_path(&path));
+                // An open that fails (Ctrl+O, a drop, a link, a sidebar click) leaves the page
+                // alone and says why in the status bar. A history move (`push_history` false)
+                // or an empty window still shows the error screen: there is nothing to keep.
+                if push_history && self.doc.is_some() {
+                    self.set_status(msg);
+                    self.pending_anchor = None;
+                    return false;
+                }
+                self.error = Some(msg);
                 self.doc = None;
                 self.path = Some(path);
                 ctx.send_viewport_cmd(ViewportCommand::Title("mdread".into()));
@@ -672,10 +776,11 @@ impl App {
         self.dialog_rx = Some(rx);
     }
 
-    /// Opens a file dropped on the window. On Windows a dropped shortcut opens its target,
-    /// and a dropped folder its README or first Markdown file: reading a folder as a file
-    /// fails there with a puzzling "Access is denied".
-    fn open_dropped(&mut self, path: PathBuf, ctx: &Context) {
+    /// Opens a file dropped on the window. A dropped folder opens its README or first
+    /// Markdown file (reading a folder as a file fails on Windows with a puzzling "Access
+    /// is denied"), and on Windows a dropped shortcut opens its target. Returns whether a
+    /// document was loaded.
+    fn open_dropped(&mut self, path: PathBuf, ctx: &Context) -> bool {
         #[cfg(windows)]
         let path = {
             let mut path = path;
@@ -685,22 +790,44 @@ impl App {
                     Some(target) => path = target,
                     None => {
                         self.set_status(format!("{} does not point to a file", links::display_path(&path)));
-                        return;
-                    }
-                }
-            }
-            if path.is_dir() {
-                match markdown_in_folder(&path) {
-                    Some(file) => path = file,
-                    None => {
-                        self.set_status(format!("No Markdown files in {}", links::display_path(&path)));
-                        return;
+                        return false;
                     }
                 }
             }
             path
         };
-        self.load_path(path, true, ctx);
+        let path = if path.is_dir() {
+            match markdown_in_folder(&path) {
+                Some(file) => file,
+                None => {
+                    self.set_status(format!("No Markdown files in {}", links::display_path(&path)));
+                    return false;
+                }
+            }
+        } else {
+            path
+        };
+        self.load_path(path, true, ctx)
+    }
+
+    /// Opens a file another launch handed over in single-window mode, as a drop would,
+    /// with the anchor and `--find` given with it. It is read on the UI thread, as a drop
+    /// or Ctrl+O is. The file shown already is not read again, so the reading position
+    /// stays unless an anchor moves it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn open_forwarded(&mut self, r: crate::single_window::Request, ctx: &Context) {
+        let shown = self.doc.is_some() && self.path.is_some() && dunce::canonicalize(&r.path).ok() == self.path;
+        if !shown && !self.open_dropped(r.path, ctx) {
+            return;
+        }
+        self.pending_anchor = r.anchor;
+        if let Some(q) = r.find {
+            self.search.open = true;
+            self.search.query = q;
+            self.search.focus_pending = true;
+            // Run again for the same query too, so the view goes to the first match.
+            self.search.last_gen = 0;
+        }
     }
 
     fn set_status(&mut self, s: impl Into<String>) {
@@ -1214,13 +1341,23 @@ impl App {
                         self.set_column_width(self.settings.column_width + 60.0);
                     }
                 }
-                Cmd::Help => self.show_help = !self.show_help,
+                Cmd::Help => {
+                    self.show_help = !self.show_help;
+                    #[cfg(windows)]
+                    if self.show_help {
+                        self.single_window_on = crate::single_window::setting();
+                    }
+                }
                 Cmd::ZoomReset => self.zoom_to(ctx, 1.0),
             }
         }
     }
 
     fn poll_channels(&mut self, ctx: &Context) {
+        #[cfg(windows)]
+        for r in crate::single_window::take_files() {
+            self.open_forwarded(r, ctx);
+        }
         if let Some(rx) = &self.watch_rx {
             let (mut changed, mut missed) = (false, false);
             while let Ok(ev) = rx.try_recv() {
@@ -1684,6 +1821,8 @@ impl App {
         let pal = self.pal;
         let base = self.settings.base_size;
         let mut open = self.show_help;
+        #[cfg(windows)]
+        let mut single_window = self.single_window_on;
         egui::Window::new(RichText::new("Keyboard shortcuts").size(base * 1.1))
             .open(&mut open)
             .collapsible(false)
@@ -1726,6 +1865,11 @@ impl App {
                     }
                 });
                 ui.add_space(10.0);
+                #[cfg(windows)]
+                {
+                    ui.checkbox(&mut single_window, RichText::new("Open files in the window that is already open").color(pal.text));
+                    ui.add_space(6.0);
+                }
                 ui.label(
                     RichText::new(format!("Fonts: {} · {}", self.fonts.sans_name, self.fonts.mono_name))
                         .size(base * 0.8)
@@ -1733,6 +1877,30 @@ impl App {
                 );
             });
         self.show_help = open;
+        #[cfg(windows)]
+        if single_window != self.single_window_on {
+            self.set_single_window(single_window, ctx);
+        }
+    }
+
+    /// The help window's checkbox. The setting is saved at once, so that it applies to the
+    /// next launch, and not on exit, so that another window's exit cannot undo it. On:
+    /// this window receives files, unless another one does already. Off: it stops, unless
+    /// it was started with `--same-window`.
+    #[cfg(windows)]
+    fn set_single_window(&mut self, on: bool, ctx: &Context) {
+        if let Err(e) = crate::single_window::set_setting(on) {
+            self.set_status(format!("Cannot save the setting: {e}"));
+            return;
+        }
+        self.single_window_on = on;
+        if on {
+            if let Some(hwnd) = self.hwnd.filter(|_| !self.never_receives) {
+                crate::single_window::start(hwnd, ctx);
+            }
+        } else if !self.same_window {
+            crate::single_window::stop();
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2313,8 +2481,8 @@ fn key_commands(i: &mut egui::InputState, typing: bool) -> Vec<Cmd> {
 }
 
 /// The file a dropped folder opens: its README or index, else the first Markdown file
-/// by name. Only this folder is looked at, as the drop is handled on the UI thread.
-#[cfg(windows)]
+/// by name. Only this folder is looked at, as the drop and the command line are handled
+/// on the UI thread.
 fn markdown_in_folder(dir: &Path) -> Option<PathBuf> {
     if let Some(p) = FOLDER_INDEX.iter().map(|n| dir.join(n)).find(|p| p.is_file()) {
         return Some(p);
@@ -2652,7 +2820,6 @@ mod tests {
         assert_eq!(key(CTRL, Key::End), [Cmd::Bottom]);
     }
 
-    #[cfg(windows)]
     #[test]
     fn dropped_folder_opens_its_readme_or_first_markdown_file() {
         let dir = std::env::temp_dir().join(format!("mdread-drop-test-{}", std::process::id()));
@@ -2696,6 +2863,221 @@ mod tests {
         app.load_path(next, true, &ctx);
         assert!(app.doc.is_some());
         assert_eq!(app.pending_anchor, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An app showing `a.md` from a fresh temp folder, and a path in it that cannot be read.
+    fn app_showing_a_page(tag: &str) -> (App, Context, PathBuf, PathBuf, PathBuf) {
+        let dir = dunce::canonicalize(std::env::temp_dir()).unwrap().join(format!("mdread-{tag}-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.md");
+        std::fs::write(&a, "# A\n").unwrap();
+        let ctx = Context::default();
+        let args = Args { files: vec![a.clone()], ..Args::default() };
+        let app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), args);
+        assert!(app.doc.is_some(), "a.md should load");
+        let missing = dir.join("missing.md");
+        (app, ctx, dir, a, missing)
+    }
+
+    #[test]
+    fn failed_open_keeps_the_shown_page() {
+        let (mut app, ctx, dir, a, missing) = app_showing_a_page("keep-page");
+        app.pending_anchor = Some("old".into());
+        assert!(!app.load_path(missing, true, &ctx));
+        assert!(app.doc.is_some());
+        assert!(app.error.is_none());
+        assert_eq!(app.path, Some(a));
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history_pos, 0);
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.starts_with("Cannot read ")), "{:?}", app.status);
+        assert_eq!(app.pending_anchor, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_open_from_the_welcome_screen_shows_the_error_screen() {
+        let dir = dunce::canonicalize(std::env::temp_dir()).unwrap().join(format!("mdread-welcome-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = Context::default();
+        let mut app = App::new(&eframe::CreationContext::_new_kittest(ctx.clone()), Args::default());
+        assert!(app.doc.is_none());
+        assert!(!app.load_path(dir.join("missing.md"), true, &ctx));
+        assert!(app.error.is_some());
+        assert!(app.doc.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_history_move_still_shows_the_error_screen() {
+        let (mut app, ctx, dir, _a, missing) = app_showing_a_page("history-move");
+        assert!(!app.load_path(missing, false, &ctx));
+        assert!(app.error.is_some());
+        assert!(app.doc.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clicking_a_link_to_an_unreadable_file_keeps_the_page_and_drops_the_anchor() {
+        use std::os::windows::fs::OpenOptionsExt;
+        // The target must exist, or `open_local` stops at "Not found" before it reads
+        // anything. Holding it open with no sharing makes the read itself fail.
+        let (mut app, ctx, dir, a, _missing) = app_showing_a_page("link-load");
+        let locked = dir.join("locked.md");
+        std::fs::write(&locked, "# Locked\n").unwrap();
+        let _hold = std::fs::OpenOptions::new().read(true).share_mode(0).open(&locked).unwrap();
+        assert!(locked.is_file());
+        assert!(std::fs::read(&locked).is_err(), "the held file should not be readable");
+        app.pending_anchor = Some("old".into());
+        let shown = app.doc.clone().unwrap();
+        app.open_local(locked, Some("x".into()), &ctx);
+        // The same parsed page is still shown, so the title (set only with a new page or
+        // the error screen) is unchanged too.
+        assert!(app.doc.as_ref().is_some_and(|d| Arc::ptr_eq(d, &shown)));
+        assert!(app.error.is_none());
+        assert_eq!(app.path, Some(a));
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.history_pos, 0);
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.starts_with("Cannot read ")), "{:?}", app.status);
+        assert_eq!(app.pending_anchor, None);
+        drop(_hold);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh temp folder for the command-line tests.
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let dir = dunce::canonicalize(std::env::temp_dir()).unwrap().join(format!("mdread-{tag}-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn app_with_args(args: Args) -> App {
+        App::new(&eframe::CreationContext::_new_kittest(Context::default()), args)
+    }
+
+    #[test]
+    fn command_line_folder_opens_its_readme() {
+        let dir = fresh_dir("cli-folder");
+        std::fs::write(dir.join("README.md"), "# Hello\n").unwrap();
+        let app = app_with_args(Args { files: vec![dir.clone()], ..Args::default() });
+        assert!(app.doc.is_some());
+        assert!(app.path.as_ref().is_some_and(|p| p.ends_with("README.md")), "{:?}", app.path);
+        assert!(app.error.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn command_line_empty_folder_sets_a_status() {
+        let dir = fresh_dir("cli-empty");
+        let app = app_with_args(Args { files: vec![dir.clone()], ..Args::default() });
+        assert!(app.doc.is_none());
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.starts_with("No Markdown files in")), "{:?}", app.status);
+        assert!(app.error.as_ref().is_some_and(|e| e.starts_with("No Markdown files in")), "{:?}", app.error);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_without_a_file_still_opens_search() {
+        let app = app_with_args(Args { find: Some("x".into()), ..Args::default() });
+        assert!(app.doc.is_none());
+        assert!(app.search.open);
+        assert_eq!(app.search.query, "x");
+    }
+
+    #[test]
+    fn find_is_not_applied_after_a_failed_load() {
+        let dir = fresh_dir("find-failed");
+        let app = app_with_args(Args { files: vec![dir.join("missing.md")], find: Some("x".into()), ..Args::default() });
+        assert!(app.doc.is_none());
+        assert!(!app.search.open);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_is_applied_after_a_successful_load() {
+        let dir = fresh_dir("find-ok");
+        let a = dir.join("a.md");
+        std::fs::write(&a, "# A\n").unwrap();
+        let app = app_with_args(Args { files: vec![a], find: Some("x".into()), ..Args::default() });
+        assert!(app.doc.is_some());
+        assert!(app.search.open);
+        assert_eq!(app.search.query, "x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn anchor_follows_the_folder_readme() {
+        let dir = fresh_dir("cli-folder-anchor");
+        std::fs::write(dir.join("README.md"), "# Top\n\n## x\n").unwrap();
+        let app = app_with_args(Args { files: vec![dir.clone()], anchor: Some("x".into()), ..Args::default() });
+        assert!(app.doc.is_some());
+        assert_eq!(app.pending_anchor.as_deref(), Some("x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_handed_over_file_opens_as_a_drop_with_its_anchor_and_find() {
+        use crate::single_window::Request;
+        let req = |path: &Path, anchor: Option<&str>, find: Option<&str>| Request { path: path.to_path_buf(), anchor: anchor.map(Into::into), find: find.map(Into::into) };
+        let (mut app, ctx, dir, _a, missing) = app_showing_a_page("handed-over");
+        let b = dir.join("b.md");
+        std::fs::write(&b, "# B\n\n## x\n").unwrap();
+        app.open_forwarded(req(&b, Some("x"), Some("B")), &ctx);
+        assert_eq!(app.path.as_ref(), Some(&b));
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.pending_anchor.as_deref(), Some("x"));
+        assert!(app.search.open && app.search.query == "B" && app.search.last_gen == 0);
+
+        // The file shown already is not read again or added to history; the anchor applies.
+        app.pending_anchor = None;
+        app.open_forwarded(req(&b, Some("x"), None), &ctx);
+        assert_eq!(app.history.len(), 2);
+        assert_eq!(app.pending_anchor.as_deref(), Some("x"));
+
+        // One that cannot be read keeps the page, as a failed drop does.
+        app.open_forwarded(req(&missing, Some("y"), None), &ctx);
+        assert_eq!(app.path.as_ref(), Some(&b));
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.starts_with("Cannot read ")), "{:?}", app.status);
+        assert_ne!(app.pending_anchor.as_deref(), Some("y"));
+
+        // A folder opens its README.
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("README.md"), "# Sub\n").unwrap();
+        app.open_forwarded(req(&sub, None, None), &ctx);
+        assert_eq!(app.path, Some(sub.join("README.md")));
+        assert_eq!(app.history.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_line_lnk_opens_its_target() {
+        let _com = crate::win::ComApartment::init();
+        let dir = fresh_dir("cli-lnk");
+        let target = dir.join("notes.md");
+        std::fs::write(&target, "# Notes\n").unwrap();
+        let lnk = dir.join("notes.md.lnk");
+        assert!(crate::win::create_shortcut(&lnk, &target));
+        let app = app_with_args(Args { files: vec![lnk], ..Args::default() });
+        assert!(app.doc.is_some());
+        assert_eq!(app.path, Some(target));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn command_line_bogus_lnk_sets_a_status() {
+        let dir = fresh_dir("cli-bad-lnk");
+        let lnk = dir.join("bogus.lnk");
+        std::fs::write(&lnk, "not a shortcut").unwrap();
+        let app = app_with_args(Args { files: vec![lnk], ..Args::default() });
+        assert!(app.doc.is_none());
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.ends_with("does not point to a file")), "{:?}", app.status);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2904,6 +3286,54 @@ mod tests {
         app_frames(&mut app, &ctx, &mut time, 5, vec![], |_| {});
 
         // The watcher holds the folder open on Windows.
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_app_handed_over_anchor_is_in_place_from_the_first_frame() {
+        // #13's receiver wrote `scroll_offset` when it opened a handed-over file, and the place
+        // correction compares against that value, so a `file#anchor` showed one wrong frame.
+        // Here it opens as a link to `file#anchor` does: every frame is checked, the first too.
+        use crate::single_window::Request;
+        let (mut app, ctx, ready, dir) = slow_app("handed-over");
+        let (a, b) = (dir.join("a.md"), dir.join("b.md"));
+        std::fs::write(&a, (1..=200).map(|i| format!("Paragraph {i} of A.\n\n")).collect::<String>()).unwrap();
+        std::fs::write(&b, slow_image_page(SlowLoader::URIS[0])).unwrap();
+        let mut time = 0.0;
+        assert!(app.load_path(a, true, &ctx));
+        app_frames(&mut app, &ctx, &mut time, 10, vec![], |_| {});
+        three_page_downs(&mut app, &ctx, &mut time, |_, _| {});
+        assert!(app.scroll_offset > app.viewport_h, "A is scrolled down");
+        let gap = render::block_gap(app.settings.base_size);
+        let target = |app: &App| app.doc.as_ref().and_then(|d| d.find_slug("target")).expect("a Target heading");
+        let in_place = |app: &App, what: &str, f: usize| {
+            let at = below_view_top(app, target(app));
+            assert!((at - gap).abs() <= 1.0, "{what} f{f}: the target is {at} below the view top, not {gap}");
+        };
+
+        // Another file, while A is scrolled down.
+        app.open_forwarded(Request { path: b.clone(), anchor: Some("target".into()), find: None }, &ctx);
+        let mut f = 0;
+        app_frames(&mut app, &ctx, &mut time, 10, vec![], |app| {
+            in_place(app, "new file", f);
+            f += 1;
+        });
+        let t = target(&app);
+        holds_across_the_flip(&mut app, &ctx, &mut time, &ready[0], t, "new file");
+
+        // The file shown already, scrolled past the anchor: not read again, moved back to it.
+        three_page_downs(&mut app, &ctx, &mut time, |_, _| {});
+        assert!(below_view_top(&app, t) < -app.viewport_h, "the view is not past the target");
+        let gen = app.gen;
+        app.open_forwarded(Request { path: b, anchor: Some("target".into()), find: None }, &ctx);
+        assert_eq!(app.gen, gen, "the file shown was read again");
+        let mut f = 0;
+        app_frames(&mut app, &ctx, &mut time, 10, vec![], |app| {
+            in_place(app, "shown file", f);
+            f += 1;
+        });
+
         drop(app);
         let _ = std::fs::remove_dir_all(&dir);
     }

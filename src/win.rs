@@ -23,7 +23,7 @@ use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
 use windows_sys::Win32::UI::Shell::{ILCreateFromPathW, ILFree, SHOpenFolderAndSelectItems, ShellLink};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, DefWindowProcW, MessageBoxW, SetWindowLongPtrW, SystemParametersInfoW, GWLP_WNDPROC, MB_ICONERROR, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
-    SPI_GETWORKAREA, WM_SETTINGCHANGE, WNDPROC,
+    SPI_GETWORKAREA, WM_COPYDATA, WM_DESTROY, WM_SETTINGCHANGE, WNDPROC,
 };
 
 /// `MDREAD_RENDERER=glow|wgpu` (case-insensitive) forces a renderer and disables the
@@ -245,17 +245,23 @@ static WINIT_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 /// Makes the title bar dark or light to match the app's theme (the `t` key, `--dark`,
 /// `--light`) rather than the system's. winit puts the system theme back on every
 /// WM_SETTINGCHANGE broadcast, which is any changed setting, not only the theme, and
-/// without telling the app. So the window procedure is wrapped once to set the app's
-/// theme again right after winit has handled the message. mdread has one window.
+/// without telling the app. So the window procedure is wrapped to set the app's theme
+/// again right after winit has handled the message.
 pub fn set_title_bar_dark(hwnd: isize, dark: bool) {
-    let hwnd = hwnd as HWND;
     TITLE_BAR_DARK.store(dark, Ordering::Relaxed);
+    wrap_window_procedure(hwnd);
+    apply_title_bar(hwnd as HWND, dark);
+}
+
+/// Puts `window_procedure` in front of winit's, once: for the title bar theme, and for
+/// the files another launch hands over in single-window mode, which winit would ignore.
+/// mdread has one window.
+pub fn wrap_window_procedure(hwnd: isize) {
     if WINIT_WNDPROC.load(Ordering::Relaxed) == 0 {
-        let wrapper: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = title_bar_wndproc;
-        let prev = unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, wrapper as isize) };
+        let wrapper: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = window_procedure;
+        let prev = unsafe { SetWindowLongPtrW(hwnd as HWND, GWLP_WNDPROC, wrapper as isize) };
         WINIT_WNDPROC.store(prev, Ordering::Relaxed);
     }
-    apply_title_bar(hwnd, dark);
 }
 
 fn apply_title_bar(hwnd: HWND, dark: bool) {
@@ -267,7 +273,13 @@ fn apply_title_bar(hwnd: HWND, dark: bool) {
     }
 }
 
-unsafe extern "system" fn title_bar_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn window_procedure(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_COPYDATA {
+        return crate::single_window::on_copy_data(lparam);
+    }
+    if msg == WM_DESTROY {
+        crate::single_window::on_destroy(hwnd as isize);
+    }
     let prev = WINIT_WNDPROC.load(Ordering::Relaxed);
     if prev == 0 {
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
@@ -348,7 +360,7 @@ pub fn shortcut_target(lnk: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-fn create_shortcut(lnk: &Path, target: &Path) -> bool {
+pub(crate) fn create_shortcut(lnk: &Path, target: &Path) -> bool {
     type SetPath = unsafe extern "system" fn(*mut c_void, *const u16) -> i32;
     type Save = unsafe extern "system" fn(*mut c_void, *const u16, i32) -> i32;
     let Some(link) = shell_link() else { return false };

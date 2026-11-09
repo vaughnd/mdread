@@ -115,9 +115,10 @@ mdread --light file.md                # force a theme for this session
 ```
 
 Open the file dialog with `Ctrl+O` (`⌘O` on macOS; uses zenity on Linux, the
-standard Open dialog on Windows) or drop a file onto the window. On Windows a
-dropped folder opens its README.md or index.md (else its first Markdown file),
-and a dropped shortcut opens its target.
+standard Open dialog on Windows) or drop a file onto the window. A folder,
+dropped or given on the command line, opens its README.md or index.md (else its
+first Markdown file). On Windows a shortcut (`.lnk`), dropped or given on the
+command line, opens its target.
 
 Files may be UTF-8 or, with a byte order mark, UTF-16; anything else is read
 in the system ANSI code page on Windows and as Windows-1252 elsewhere, and the
@@ -139,6 +140,19 @@ there is no terminal. In PowerShell, pipe instead of redirecting
 (`mdread --help | Out-File help.txt`, `mdread --version | Out-String`): `>` and
 `$x = mdread ...` capture nothing and `$LASTEXITCODE` is not set. In cmd.exe `>`
 works.
+
+On Windows, files can open in the window that is already open instead of a new
+one: tick "Open files in the window that is already open" in the `?` window. The
+first window opened while it is on receives the files until it closes (or the
+window it was ticked in, if no other receives), and Back returns to the page
+before. `--new-window` opens a window of its own for one launch, and
+`--same-window` sends one launch to the receiving window whatever the setting
+says (a window started with it receives later `--same-window` launches); if both
+are given, the last one wins. Windows reading stdin or taking a `--screenshot`
+never receive, and `--dark`/`--light`/`--system` launches open their own window.
+A launch that hands its file over exits at once, so `Start-Process -Wait` does
+not wait for the window. The setting is the DWORD `SingleWindow` under
+`HKCU\Software\mdread`.
 
 On Windows, links leave the app only for `http`, `https` and `mailto`. A link to
 a local file opens it in its default app only for images, PDF, plain text, data
