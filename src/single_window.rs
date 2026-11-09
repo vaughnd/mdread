@@ -328,8 +328,11 @@ mod imp {
                     // Not receiving any more (it is closing, or the setting was turned off
                     // in it): its role is given up soon.
                     Sent::Refused => {}
+                    // Hung or busy (it keeps the role), or closed after it was found: a
+                    // closing window gives up the role in WM_DESTROY, so this one can take it.
                     Sent::Failed => {
-                        log::info!("single-window mode: the receiving window did not answer; opening a window of its own");
+                        let took = claim(me);
+                        log::info!("single-window mode: the receiving window did not answer; opening a window of its own{}", if took { " that receives" } else { "" });
                         return false;
                     }
                 }
