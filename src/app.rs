@@ -576,10 +576,7 @@ impl App {
     /// Open `path` with the files sidebar showing `files_dir`, or a folder chosen by
     /// `files::sidebar_root` when that is `None`. Returns whether the file was read.
     fn load_path_in(&mut self, path: PathBuf, push_history: bool, files_dir: Option<PathBuf>, ctx: &Context) -> bool {
-        // dunce leaves out the `\\?\` prefix Windows puts on canonical paths. Some virtual
-        // drives cannot be canonicalized; an absolute path still gives the folder links
-        // and the sidebar start from.
-        let path = dunce::canonicalize(&path).or_else(|_| std::path::absolute(&path)).unwrap_or(path);
+        let path = opened_path(path);
         let stamp = file_stamp(&path);
         match std::fs::read(&path) {
             Ok(bytes) => {
@@ -822,7 +819,10 @@ impl App {
     #[cfg_attr(not(windows), allow(dead_code))]
     fn open_forwarded(&mut self, r: crate::single_window::Request, ctx: &Context) {
         let Some(path) = self.dropped_file(r.path) else { return };
-        let shown = self.doc.is_some() && self.path.is_some() && dunce::canonicalize(&path).ok() == self.path;
+        // Made as `load_path_in` makes it, so that a file on a drive that cannot be
+        // canonicalized is recognised too.
+        let path = opened_path(path);
+        let shown = self.doc.is_some() && self.path.as_ref() == Some(&path);
         if !shown && !self.load_path(path, true, ctx) {
             return;
         }
@@ -2495,6 +2495,13 @@ fn key_commands(i: &mut egui::InputState, typing: bool) -> Vec<Cmd> {
 /// The file a dropped folder opens: its README or index, else the first Markdown file
 /// by name. Only this folder is looked at, as the drop and the command line are handled
 /// on the UI thread.
+/// The path a file is shown under. dunce leaves out the `\\?\` prefix Windows puts on
+/// canonical paths. Some virtual drives cannot be canonicalized; an absolute path still
+/// gives the folder links and the sidebar start from.
+fn opened_path(path: PathBuf) -> PathBuf {
+    dunce::canonicalize(&path).or_else(|_| std::path::absolute(&path)).unwrap_or(path)
+}
+
 fn markdown_in_folder(dir: &Path) -> Option<PathBuf> {
     if let Some(p) = FOLDER_INDEX.iter().map(|n| dir.join(n)).find(|p| p.is_file()) {
         return Some(p);
