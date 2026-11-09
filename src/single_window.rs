@@ -181,7 +181,7 @@ mod imp {
     use windows_sys::Win32::System::Registry::{RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD};
     use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetPropW, GetWindowThreadProcessId, IsIconic, RemovePropW, SendMessageTimeoutW, SetForegroundWindow, SetPropW, ShowWindowAsync, SMTO_ABORTIFHUNG, SW_RESTORE, WM_COPYDATA,
+        EnumWindows, GetPropW, GetWindowThreadProcessId, IsIconic, IsWindow, RemovePropW, SendMessageTimeoutW, SetForegroundWindow, SetPropW, ShowWindowAsync, SMTO_ABORTIFHUNG, SW_RESTORE, WM_COPYDATA,
     };
 
     /// The registry value that holds the setting, a DWORD that is 1 for on. Not part of
@@ -364,12 +364,19 @@ mod imp {
                     // Not receiving any more (it is closing, or the setting was turned off
                     // in it): its role is given up soon.
                     Sent::Refused => {}
-                    // Hung or busy (it keeps the role), or closed after it was found: a
-                    // closing window gives up the role in WM_DESTROY, so this one can take it.
+                    // Closed after it was found: a closing window gives up the role in
+                    // WM_DESTROY, so this one can take it, or another launch has, and its
+                    // window is found once it is up. Hung or busy: it keeps the role.
                     Sent::Failed => {
-                        let took = claim(me);
-                        log::info!("single-window mode: the receiving window did not answer; opening a window of its own{}", if took { " that receives" } else { "" });
-                        return false;
+                        if claim(me) {
+                            log::debug!("single-window mode: the receiving window closed; this one will receive");
+                            return false;
+                        }
+                        // SAFETY: a plain query; a stale handle gives 0.
+                        if unsafe { IsWindow(hwnd) } != 0 {
+                            log::info!("single-window mode: the receiving window did not answer; opening a window of its own");
+                            return false;
+                        }
                     }
                 }
             }
