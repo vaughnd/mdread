@@ -3291,6 +3291,54 @@ mod tests {
     }
 
     #[test]
+    fn real_app_handed_over_anchor_is_in_place_from_the_first_frame() {
+        // #13's receiver wrote `scroll_offset` when it opened a handed-over file, and the place
+        // correction compares against that value, so a `file#anchor` showed one wrong frame.
+        // Here it opens as a link to `file#anchor` does: every frame is checked, the first too.
+        use crate::single_window::Request;
+        let (mut app, ctx, ready, dir) = slow_app("handed-over");
+        let (a, b) = (dir.join("a.md"), dir.join("b.md"));
+        std::fs::write(&a, (1..=200).map(|i| format!("Paragraph {i} of A.\n\n")).collect::<String>()).unwrap();
+        std::fs::write(&b, slow_image_page(SlowLoader::URIS[0])).unwrap();
+        let mut time = 0.0;
+        assert!(app.load_path(a, true, &ctx));
+        app_frames(&mut app, &ctx, &mut time, 10, vec![], |_| {});
+        three_page_downs(&mut app, &ctx, &mut time, |_, _| {});
+        assert!(app.scroll_offset > app.viewport_h, "A is scrolled down");
+        let gap = render::block_gap(app.settings.base_size);
+        let target = |app: &App| app.doc.as_ref().and_then(|d| d.find_slug("target")).expect("a Target heading");
+        let in_place = |app: &App, what: &str, f: usize| {
+            let at = below_view_top(app, target(app));
+            assert!((at - gap).abs() <= 1.0, "{what} f{f}: the target is {at} below the view top, not {gap}");
+        };
+
+        // Another file, while A is scrolled down.
+        app.open_forwarded(Request { path: b.clone(), anchor: Some("target".into()), find: None }, &ctx);
+        let mut f = 0;
+        app_frames(&mut app, &ctx, &mut time, 10, vec![], |app| {
+            in_place(app, "new file", f);
+            f += 1;
+        });
+        let t = target(&app);
+        holds_across_the_flip(&mut app, &ctx, &mut time, &ready[0], t, "new file");
+
+        // The file shown already, scrolled past the anchor: not read again, moved back to it.
+        three_page_downs(&mut app, &ctx, &mut time, |_, _| {});
+        assert!(below_view_top(&app, t) < -app.viewport_h, "the view is not past the target");
+        let gen = app.gen;
+        app.open_forwarded(Request { path: b, anchor: Some("target".into()), find: None }, &ctx);
+        assert_eq!(app.gen, gen, "the file shown was read again");
+        let mut f = 0;
+        app_frames(&mut app, &ctx, &mut time, 10, vec![], |app| {
+            in_place(app, "shown file", f);
+            f += 1;
+        });
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn real_app_reading_position_stays_across_a_slow_image() {
         let (mut app, ctx, ready, dir) = slow_app("reading");
         let page = dir.join("page.md");
