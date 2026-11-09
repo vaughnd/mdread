@@ -79,6 +79,11 @@ impl Fill {
     const NONE: Fill = Fill { color: Color32::TRANSPARENT, expand: 0.0, dy: 0.0 };
 }
 
+/// The space between blocks at base size `base`, which a jump also leaves above its target.
+pub fn block_gap(base: f32) -> f32 {
+    base * 0.9
+}
+
 impl<'a> RenderCtx<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -115,7 +120,7 @@ impl<'a> RenderCtx<'a> {
 
     /// Vertical space between blocks.
     pub fn gap(&self) -> f32 {
-        self.size * 0.9
+        block_gap(self.size)
     }
 
     fn fs(&self) -> f32 {
