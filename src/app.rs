@@ -634,7 +634,8 @@ impl App {
                 if text == self.source {
                     return;
                 }
-                let (offset, place) = (self.scroll_offset, self.place);
+                // A page not drawn yet is where its open or Back put it.
+                let (offset, place) = (self.pending_offset.unwrap_or(self.scroll_offset), self.place);
                 self.set_document(text, Some(path), ctx);
                 self.pending_offset = Some(offset);
                 self.restore_place(place);
@@ -3105,6 +3106,19 @@ mod tests {
         assert_eq!(app.history.len(), 3);
         assert_eq!(app.history[0].offset, 500.0);
         assert_eq!(app.history[1].offset, 0.0, "b was never drawn: Back to it must open at the top");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reload_before_the_first_frame_keeps_the_open_position() {
+        let (mut app, ctx, dir, a, _missing) = app_showing_a_page("reload-undrawn");
+        // Opened and not drawn yet, with the page before's offset still in `scroll_offset`.
+        assert_eq!(app.pending_offset, Some(0.0));
+        app.scroll_offset = 500.0;
+        std::fs::write(&a, "# A, changed\n").unwrap();
+        app.reload(&ctx, false);
+        assert_eq!(app.source, "# A, changed\n");
+        assert_eq!(app.pending_offset, Some(0.0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
