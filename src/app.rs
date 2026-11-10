@@ -1913,7 +1913,12 @@ impl App {
                 crate::single_window::start(hwnd, ctx);
             }
         } else if !self.same_window {
+            // Files that came after this frame's poll were answered as taken: open them.
+            let files = crate::single_window::take_files();
             crate::single_window::stop();
+            for r in files {
+                self.open_forwarded(r, ctx);
+            }
         }
     }
 
