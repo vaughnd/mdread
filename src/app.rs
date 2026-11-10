@@ -576,10 +576,7 @@ impl App {
     /// Open `path` with the files sidebar showing `files_dir`, or a folder chosen by
     /// `files::sidebar_root` when that is `None`. Returns whether the file was read.
     fn load_path_in(&mut self, path: PathBuf, push_history: bool, files_dir: Option<PathBuf>, ctx: &Context) -> bool {
-        // dunce leaves out the `\\?\` prefix Windows puts on canonical paths. Some virtual
-        // drives cannot be canonicalized; an absolute path still gives the folder links
-        // and the sidebar start from.
-        let path = dunce::canonicalize(&path).or_else(|_| std::path::absolute(&path)).unwrap_or(path);
+        let path = opened_path(path);
         let stamp = file_stamp(&path);
         match std::fs::read(&path) {
             Ok(bytes) => {
@@ -637,7 +634,8 @@ impl App {
                 if text == self.source {
                     return;
                 }
-                let (offset, place) = (self.scroll_offset, self.place);
+                // A page not drawn yet is where its open or Back put it.
+                let (offset, place) = (self.pending_offset.unwrap_or(self.scroll_offset), self.place);
                 self.set_document(text, Some(path), ctx);
                 self.pending_offset = Some(offset);
                 self.restore_place(place);
@@ -776,11 +774,16 @@ impl App {
         self.dialog_rx = Some(rx);
     }
 
-    /// Opens a file dropped on the window. A dropped folder opens its README or first
-    /// Markdown file (reading a folder as a file fails on Windows with a puzzling "Access
-    /// is denied"), and on Windows a dropped shortcut opens its target. Returns whether a
-    /// document was loaded.
+    /// Opens a file dropped on the window. Returns whether a document was loaded.
     fn open_dropped(&mut self, path: PathBuf, ctx: &Context) -> bool {
+        self.dropped_file(path).is_some_and(|path| self.load_path(path, true, ctx))
+    }
+
+    /// The file a drop opens. A dropped folder opens its README or first Markdown file
+    /// (reading a folder as a file fails on Windows with a puzzling "Access is denied"),
+    /// and on Windows a dropped shortcut opens its target. None, with the reason in the
+    /// status bar, if there is no such file.
+    fn dropped_file(&mut self, path: PathBuf) -> Option<PathBuf> {
         #[cfg(windows)]
         let path = {
             let mut path = path;
@@ -790,7 +793,7 @@ impl App {
                     Some(target) => path = target,
                     None => {
                         self.set_status(format!("{} does not point to a file", links::display_path(&path)));
-                        return false;
+                        return None;
                     }
                 }
             }
@@ -801,23 +804,28 @@ impl App {
                 Some(file) => file,
                 None => {
                     self.set_status(format!("No Markdown files in {}", links::display_path(&path)));
-                    return false;
+                    return None;
                 }
             }
         } else {
             path
         };
-        self.load_path(path, true, ctx)
+        Some(path)
     }
 
     /// Opens a file another launch handed over in single-window mode, as a drop would,
     /// with the anchor and `--find` given with it. It is read on the UI thread, as a drop
-    /// or Ctrl+O is. The file shown already is not read again, so the reading position
-    /// stays unless an anchor moves it.
+    /// or Ctrl+O is. The file shown already, also when a shortcut or folder leads to it, is
+    /// not read again, so the reading position stays unless an anchor moves it.
     #[cfg_attr(not(windows), allow(dead_code))]
     fn open_forwarded(&mut self, r: crate::single_window::Request, ctx: &Context) {
-        let shown = self.doc.is_some() && self.path.is_some() && dunce::canonicalize(&r.path).ok() == self.path;
-        if !shown && !self.open_dropped(r.path, ctx) {
+        let Some(path) = self.dropped_file(r.path) else { return };
+        // Made as `load_path_in` makes it, so that a file on a drive that cannot be
+        // canonicalized is recognised too. That also makes the path of a deleted file, which
+        // is read again so that the status bar says why it cannot be.
+        let path = opened_path(path);
+        let shown = self.doc.is_some() && self.path.as_ref() == Some(&path) && path.is_file();
+        if !shown && !self.load_path(path, true, ctx) {
             return;
         }
         self.pending_anchor = r.anchor;
@@ -884,7 +892,13 @@ impl App {
     /// Note where the current file was left, for coming back to it.
     fn save_visit(&mut self) {
         if let Some(cur) = self.history.get_mut(self.history_pos) {
-            cur.offset = self.scroll_offset;
+            // A page opened but not drawn yet (a second file opened in the same frame, as when
+            // several are handed over at once) was left where its open put it, not where the page
+            // before it was scrolled to. End's `f32::MAX` is not a position.
+            cur.offset = match self.pending_offset {
+                Some(o) if o < f32::MAX => o,
+                _ => self.scroll_offset,
+            };
             cur.place = self.place;
             cur.files_dir = self.files_dir.clone();
         }
@@ -1899,7 +1913,12 @@ impl App {
                 crate::single_window::start(hwnd, ctx);
             }
         } else if !self.same_window {
+            // Files that came after this frame's poll were answered as taken: open them.
+            let files = crate::single_window::take_files();
             crate::single_window::stop();
+            for r in files {
+                self.open_forwarded(r, ctx);
+            }
         }
     }
 
@@ -2480,6 +2499,13 @@ fn key_commands(i: &mut egui::InputState, typing: bool) -> Vec<Cmd> {
     cmds
 }
 
+/// The path a file is shown under. dunce leaves out the `\\?\` prefix Windows puts on
+/// canonical paths. Some virtual drives cannot be canonicalized; an absolute path still
+/// gives the folder links and the sidebar start from.
+fn opened_path(path: PathBuf) -> PathBuf {
+    dunce::canonicalize(&path).or_else(|_| std::path::absolute(&path)).unwrap_or(path)
+}
+
 /// The file a dropped folder opens: its README or index, else the first Markdown file
 /// by name. Only this folder is looked at, as the drop and the command line are handled
 /// on the UI thread.
@@ -3051,6 +3077,77 @@ mod tests {
         app.open_forwarded(req(&sub, None, None), &ctx);
         assert_eq!(app.path, Some(sub.join("README.md")));
         assert_eq!(app.history.len(), 3);
+
+        // The folder again, or its README by name: it is shown already, so the page stays.
+        app.scroll_offset = 300.0;
+        app.pending_offset = None;
+        app.open_forwarded(req(&sub, None, None), &ctx);
+        app.open_forwarded(req(&sub.join("README.md"), None, None), &ctx);
+        assert_eq!(app.history.len(), 3);
+        assert_eq!(app.pending_offset, None, "not read again, so not sent to the top");
+
+        // A folder with no Markdown says so and keeps the page.
+        let empty = dir.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        app.open_forwarded(req(&empty, Some("z"), None), &ctx);
+        assert_eq!(app.path, Some(sub.join("README.md")));
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.starts_with("No Markdown files in ")), "{:?}", app.status);
+        assert_ne!(app.pending_anchor.as_deref(), Some("z"));
+
+        // The shown file, deleted: it is read again, so the status bar says why it cannot be.
+        app.status = None;
+        std::fs::remove_file(sub.join("README.md")).unwrap();
+        app.open_forwarded(req(&sub.join("README.md"), None, None), &ctx);
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.starts_with("Cannot read ")), "{:?}", app.status);
+        assert_eq!(app.history.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_handed_over_in_one_frame_keep_their_own_offsets() {
+        use crate::single_window::Request;
+        let req = |path: &Path| Request { path: path.to_path_buf(), anchor: None, find: None };
+        let (mut app, ctx, dir, _a, _missing) = app_showing_a_page("handed-together");
+        let (b, c) = (dir.join("b.md"), dir.join("c.md"));
+        std::fs::write(&b, "# B\n").unwrap();
+        std::fs::write(&c, "# C\n").unwrap();
+        // The page shown was drawn and scrolled; no frame draws between the two files.
+        app.scroll_offset = 500.0;
+        app.pending_offset = None;
+        app.open_forwarded(req(&b), &ctx);
+        app.open_forwarded(req(&c), &ctx);
+        assert_eq!(app.history.len(), 3);
+        assert_eq!(app.history[0].offset, 500.0);
+        assert_eq!(app.history[1].offset, 0.0, "b was never drawn: Back to it must open at the top");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_reload_before_the_first_frame_keeps_the_open_position() {
+        let (mut app, ctx, dir, a, _missing) = app_showing_a_page("reload-undrawn");
+        // Opened and not drawn yet, with the page before's offset still in `scroll_offset`.
+        assert_eq!(app.pending_offset, Some(0.0));
+        app.scroll_offset = 500.0;
+        std::fs::write(&a, "# A, changed\n").unwrap();
+        app.reload(&ctx, false);
+        assert_eq!(app.source, "# A, changed\n");
+        assert_eq!(app.pending_offset, Some(0.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_handed_over_shortcut_to_the_shown_file_keeps_the_page() {
+        use crate::single_window::Request;
+        let _com = crate::win::ComApartment::init();
+        let (mut app, ctx, dir, a, _missing) = app_showing_a_page("handed-over-lnk");
+        let lnk = dir.join("a.md.lnk");
+        assert!(crate::win::create_shortcut(&lnk, &a));
+        app.scroll_offset = 300.0;
+        app.pending_offset = None;
+        app.open_forwarded(Request { path: lnk, anchor: None, find: None }, &ctx);
+        assert_eq!(app.history.len(), 1);
+        assert_eq!(app.pending_offset, None, "not read again, so not sent to the top");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

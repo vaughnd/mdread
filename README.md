@@ -145,11 +145,13 @@ On Windows, files can open in the window that is already open instead of a new
 one: tick "Open files in the window that is already open" in the `?` window. The
 first window opened while it is on receives the files until it closes (or the
 window it was ticked in, if no other receives), and Back returns to the page
-before. `--new-window` opens a window of its own for one launch, and
-`--same-window` sends one launch to the receiving window whatever the setting
-says (a window started with it receives later `--same-window` launches); if both
-are given, the last one wins. Windows reading stdin or taking a `--screenshot`
-never receive, and `--dark`/`--light`/`--system` launches open their own window.
+before. `--new-window` opens a window of its own instead of handing the file
+over, and `--same-window` sends one launch to the receiving window whatever the
+setting says (a window started with it receives later `--same-window` launches);
+if both are given, the last one wins. `--dark`/`--light`/`--system` launches,
+and launches given a device or pipe name (`\\.\pipe\x`, `COM1`), also open their
+own window. Like any window, these receive later files if no other window does;
+windows reading stdin or taking a `--screenshot` never receive.
 A launch that hands its file over exits at once, so `Start-Process -Wait` does
 not wait for the window. The setting is the DWORD `SingleWindow` under
 `HKCU\Software\mdread`.
