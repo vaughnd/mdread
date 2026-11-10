@@ -821,9 +821,10 @@ impl App {
     fn open_forwarded(&mut self, r: crate::single_window::Request, ctx: &Context) {
         let Some(path) = self.dropped_file(r.path) else { return };
         // Made as `load_path_in` makes it, so that a file on a drive that cannot be
-        // canonicalized is recognised too.
+        // canonicalized is recognised too. That also makes the path of a deleted file, which
+        // is read again so that the status bar says why it cannot be.
         let path = opened_path(path);
-        let shown = self.doc.is_some() && self.path.as_ref() == Some(&path);
+        let shown = self.doc.is_some() && self.path.as_ref() == Some(&path) && path.is_file();
         if !shown && !self.load_path(path, true, ctx) {
             return;
         }
@@ -3087,6 +3088,13 @@ mod tests {
         assert_eq!(app.path, Some(sub.join("README.md")));
         assert!(app.status.as_ref().is_some_and(|(s, _)| s.starts_with("No Markdown files in ")), "{:?}", app.status);
         assert_ne!(app.pending_anchor.as_deref(), Some("z"));
+
+        // The shown file, deleted: it is read again, so the status bar says why it cannot be.
+        app.status = None;
+        std::fs::remove_file(sub.join("README.md")).unwrap();
+        app.open_forwarded(req(&sub.join("README.md"), None, None), &ctx);
+        assert!(app.status.as_ref().is_some_and(|(s, _)| s.starts_with("Cannot read ")), "{:?}", app.status);
+        assert_eq!(app.history.len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
