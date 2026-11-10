@@ -82,7 +82,7 @@ fn request_for(args: &Args) -> Option<Request> {
 /// serial port can block until it answers, which would freeze a window the user already
 /// has open. A path wrongly taken for one only costs a window of its own. Works on the
 /// text, so that it reads the same in tests on every OS.
-fn names_a_device(path: &Path) -> bool {
+pub fn names_a_device(path: &Path) -> bool {
     let s = path.to_string_lossy().replace('/', "\\").to_lowercase();
     // `\\.\` reaches devices and pipes. `\\?\` does too, except as `\\?\C:\` or
     // `\\?\UNC\server\share`, which are files and shares written long.

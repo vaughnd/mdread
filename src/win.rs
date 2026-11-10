@@ -338,8 +338,10 @@ fn shell_link() -> Option<ComPtr> {
 
 /// The file or folder a shortcut (.lnk) points to. Only reads the path stored in the
 /// shortcut: a moved target is not searched for, so this never blocks on the network.
-/// None for shortcuts to things that are not files, such as Control Panel items. Needs
-/// COM on the calling thread ([`ComApartment`]).
+/// None for shortcuts to things that are not files, such as Control Panel items, and to
+/// devices, pipes and mailslots, which would block the UI thread that reads the target
+/// (see [`crate::single_window::names_a_device`]). Needs COM on the calling thread
+/// ([`ComApartment`]).
 pub fn shortcut_target(lnk: &Path) -> Option<PathBuf> {
     type Load = unsafe extern "system" fn(*mut c_void, *const u16, u32) -> i32;
     type GetPath = unsafe extern "system" fn(*mut c_void, *mut u16, i32, *mut c_void, u32) -> i32;
@@ -356,7 +358,8 @@ pub fn shortcut_target(lnk: &Path) -> Option<PathBuf> {
         }
     }
     let len = buf.iter().position(|&c| c == 0)?;
-    (len > 0).then(|| PathBuf::from(OsString::from_wide(&buf[..len])))
+    let target = PathBuf::from(OsString::from_wide(&buf[..len]));
+    (len > 0 && !crate::single_window::names_a_device(&target)).then_some(target)
 }
 
 #[cfg(test)]
@@ -386,6 +389,10 @@ mod tests {
         assert!(create_shortcut(&lnk, &target));
         assert_eq!(shortcut_target(&lnk), Some(target));
         assert_eq!(shortcut_target(&dir.join("missing.lnk")), None);
+        // A shortcut to a device name points to no file.
+        let nul = dir.join("nul.lnk");
+        assert!(create_shortcut(&nul, &dir.join("NUL")));
+        assert_eq!(shortcut_target(&nul), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
