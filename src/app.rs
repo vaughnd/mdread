@@ -2494,9 +2494,6 @@ fn key_commands(i: &mut egui::InputState, typing: bool) -> Vec<Cmd> {
     cmds
 }
 
-/// The file a dropped folder opens: its README or index, else the first Markdown file
-/// by name. Only this folder is looked at, as the drop and the command line are handled
-/// on the UI thread.
 /// The path a file is shown under. dunce leaves out the `\\?\` prefix Windows puts on
 /// canonical paths. Some virtual drives cannot be canonicalized; an absolute path still
 /// gives the folder links and the sidebar start from.
@@ -2504,6 +2501,9 @@ fn opened_path(path: PathBuf) -> PathBuf {
     dunce::canonicalize(&path).or_else(|_| std::path::absolute(&path)).unwrap_or(path)
 }
 
+/// The file a dropped folder opens: its README or index, else the first Markdown file
+/// by name. Only this folder is looked at, as the drop and the command line are handled
+/// on the UI thread.
 fn markdown_in_folder(dir: &Path) -> Option<PathBuf> {
     if let Some(p) = FOLDER_INDEX.iter().map(|n| dir.join(n)).find(|p| p.is_file()) {
         return Some(p);
